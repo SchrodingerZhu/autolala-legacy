@@ -12,7 +12,7 @@ import time
 import hashlib
 import threading
 
-POLYGEIST_PATH=os.getenv("POLYGEIST_PATH", "/usr/bin")
+POLYGEIST_PATH=os.getenv("POLYGEIST_PATH", "")
 
 # ANSI color codes
 class Colors:
@@ -145,8 +145,8 @@ def extract_prediction_data(json_path):
 
 def convert_c_to_mlir(c_file, output_mlir):
     """Convert a C file to MLIR using polygeist"""
-    cgeist_path = os.path.join(POLYGEIST_PATH, "cgeist")
-    polygeist_opt_path = os.path.join(POLYGEIST_PATH, "polygeist-opt")
+    cgeist_path = os.path.join(POLYGEIST_PATH, "cgeist") if POLYGEIST_PATH else "cgeist"
+    polygeist_opt_path = os.path.join(POLYGEIST_PATH, "polygeist-opt") if POLYGEIST_PATH else "polygeist-opt"
     
     # Check if polygeist binaries exist
     if not os.path.exists(cgeist_path):
@@ -159,7 +159,10 @@ def convert_c_to_mlir(c_file, output_mlir):
     print(f"{Colors.CYAN}🔄 Converting C file to MLIR: {os.path.basename(c_file)} -> {os.path.basename(output_mlir)}{Colors.RESET}")
     
     # Create the pipeline command: cgeist input.c -S -raise-scf-to-affine | polygeist-opt -strip-dlti-attributes
-    cmd = f'"{cgeist_path}" "{c_file}" -S -raise-scf-to-affine | "{polygeist_opt_path}" -strip-dlti-attributes > "{output_mlir}"'
+    # Current Polygeist has no -strip-dlti-attributes pass; canonicalize, then
+    # strip the module attribute dict textually (its dlti.dl_spec breaks the
+    # analyzer's newer MLIR parser).
+    cmd = f'"{cgeist_path}" "{c_file}" -S -raise-scf-to-affine | "{polygeist_opt_path}" --canonicalize | sed -E "1s/^module attributes \\{{.*\\}} \\{{$/module {{/" > "{output_mlir}"'
     
     # Create and start spinner
     spinner = Spinner("Converting C to MLIR")
@@ -260,7 +263,7 @@ def main():
         print(f"\n{Colors.BOLD}{Colors.GREEN}⏭️  Step 1/4: Skipping fully associative analysis - file exists: {os.path.basename(full_json)}{Colors.RESET}")
     else:
         cmd1 = [
-            "cargo", "run", "-p", "analyzer", "--release", "--",
+            os.getenv("ANALYZER", "analyzer"),
             "--json",
             "-i", input_file,
             "-o", full_json,
@@ -276,7 +279,7 @@ def main():
         print(f"\n{Colors.BOLD}{Colors.GREEN}⏭️  Step 2/4: Skipping associative conversion - file exists: {os.path.basename(assoc_json)}{Colors.RESET}")
     else:
         cmd2 = [
-            "cargo", "run", "-p", "assoc-conv", "--release", "--",
+            os.getenv("ASSOC_CONV", "assoc-conv"),
             "-i", full_json,
             "-a", str(args.associativity),
             "-o", assoc_json
@@ -293,7 +296,7 @@ def main():
         print(f"\n{Colors.BOLD}{Colors.GREEN}⏭️  Step 3/4: Skipping fully associative simulation - file exists: {os.path.basename(full_db)}{Colors.RESET}")
     else:
         cmd3 = [
-            "cargo", "run", "-p", "cachegrind-runner", "--release", "--",
+            os.getenv("CACHEGRIND_RUNNER", "cachegrind-runner"),
             "-i", input_file,
             "-C", str(c_prime),
             f"-B{b_prime}",
@@ -310,7 +313,7 @@ def main():
         print(f"\n{Colors.BOLD}{Colors.GREEN}⏭️  Step 4/4: Skipping associative simulation - file exists: {os.path.basename(assoc_db)}{Colors.RESET}")
     else:
         cmd4 = [
-            "cargo", "run", "-p", "cachegrind-runner", "--release", "--",
+            os.getenv("CACHEGRIND_RUNNER", "cachegrind-runner"),
             "-i", input_file,
             "-C", str(c_prime),
             f"-B{b_prime}",
