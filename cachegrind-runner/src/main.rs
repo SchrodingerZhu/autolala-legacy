@@ -615,6 +615,25 @@ fn collect_allocs(func: OperationRef) -> anyhow::Result<Vec<GlobalArrayDeclarati
     Ok(arrays)
 }
 
+/// cachegrind requires each cache's set count (size / (associativity *
+/// block_size)) to be a power of two. Aborts with a message naming the
+/// offending cache and parameters if it is not — a non-power-of-two config
+/// makes valgrind refuse to run, and a silently-recorded zero row is worse
+/// than a loud failure.
+fn check_cache_geometry(name: &str, size: usize, assoc: usize, block: usize) {
+    assert!(assoc > 0 && block > 0, "{name} cache: assoc and block must be > 0");
+    let denom = assoc * block;
+    assert!(
+        size % denom == 0,
+        "{name} cache size {size} is not a multiple of assoc*block ({assoc}*{block}={denom})"
+    );
+    let sets = size / denom;
+    assert!(
+        sets.is_power_of_two(),
+        "{name} cache set count {sets} = {size}/({assoc}*{block}) is not a power of two;          cachegrind will refuse this config. Pick a size/assoc/block whose set count is a          power of two, or run a valid config and derive this associativity with assoc-conv."
+    );
+}
+
 fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -730,6 +749,18 @@ fn main() {
             let associativity = args
                 .d1_associativity
                 .unwrap_or_else(|| cache_size / args.d1_block_size);
+            // cachegrind requires each cache's set count — size/(assoc*block) —
+            // to be a power of two, and refuses to run otherwise. Catch that
+            // here with a message naming the parameter, rather than letting
+            // valgrind fail and recording a row of zeros that reads as a real
+            // (all-hit) measurement downstream.
+            check_cache_geometry("D1", cache_size, associativity, args.d1_block_size);
+            check_cache_geometry(
+                "LL",
+                args.ll_cache_size,
+                args.ll_associativity,
+                args.ll_block_size,
+            );
             let d1_string = format!(
                 "--D1={},{},{}",
                 cache_size, associativity, args.d1_block_size,
@@ -739,7 +770,7 @@ fn main() {
                 args.ll_cache_size, args.ll_associativity, args.ll_block_size,
             );
             let start = std::time::Instant::now();
-            let output = std::process::Command::new(&args.valgrind_path)
+            let raw = std::process::Command::new(&args.valgrind_path)
                 .arg("--tool=cachegrind")
                 .arg("--cache-sim=yes")
                 .arg("-v")
@@ -750,26 +781,45 @@ fn main() {
                 .output()
                 .unwrap();
             let process_time = start.elapsed().as_nanos() as usize;
-            let output = String::from_utf8_lossy(&output.stderr);
+            let output = String::from_utf8_lossy(&raw.stderr);
             info!("Valgrind output:\n{output}");
-            let mut total_access = 0usize;
-            let mut d1_miss_count = 0usize;
-            let mut ll_miss_count = 0usize;
+            // Fail closed: a non-zero valgrind exit, or output that never
+            // yields the summary lines, must abort — never persist a
+            // zero-filled row that is indistinguishable from a real all-hit
+            // result. "did not measure" and "measured zero" are different facts.
+            if !raw.status.success() {
+                panic!(
+                    "valgrind failed for {program} (exit {:?}); not recording. \
+                     stderr:\n{output}",
+                    raw.status.code()
+                );
+            }
+            let mut total_access = None;
+            let mut d1_miss_count = None;
+            let mut ll_miss_count = None;
             for line in output.lines() {
                 if line.contains("D refs:") {
                     if let Some(value) = line.split(':').nth(1).and_then(|s| s.split('(').next()) {
-                        total_access = value.trim().replace(",", "").parse().unwrap_or(0);
+                        total_access = value.trim().replace(",", "").parse().ok();
                     }
                 } else if line.contains("D1  misses:") {
                     if let Some(value) = line.split(':').nth(1).and_then(|s| s.split('(').next()) {
-                        d1_miss_count = value.trim().replace(",", "").parse().unwrap_or(0);
+                        d1_miss_count = value.trim().replace(",", "").parse().ok();
                     }
                 } else if line.contains("LLd misses:")
                     && let Some(value) = line.split(':').nth(1).and_then(|s| s.split('(').next())
                 {
-                    ll_miss_count = value.trim().replace(",", "").parse().unwrap_or(0);
+                    ll_miss_count = value.trim().replace(",", "").parse().ok();
                 }
             }
+            let (total_access, d1_miss_count, ll_miss_count) =
+                match (total_access, d1_miss_count, ll_miss_count) {
+                    (Some(t), Some(d), Some(l)) => (t, d, l),
+                    _ => panic!(
+                        "valgrind produced no parseable cache summary for {program}; \
+                         not recording. stderr:\n{output}"
+                    ),
+                };
 
             let record = Record {
                 program: program.clone(),
