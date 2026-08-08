@@ -3,33 +3,41 @@
 #
 # Two toolchains, both from apt.llvm.org — nothing is compiled from LLVM
 # source:
-#   - Polygeist pins LLVM 16 (its llvm-project submodule), so its stage is
-#     ubuntu 22.04 + apt LLVM 16 (apt.llvm.org does not build 16 for noble).
+#   - Polygeist pins LLVM 18 (its llvm-project submodule), so its stage is
+#     ubuntu 22.04 + apt LLVM 18 (apt.llvm.org does not build 18 for noble).
 #   - The analyzer builds on ubuntu 24.04 + apt LLVM 22 (mlir-sys 220 /
 #     melior 0.27).
-# The final image is 24.04; the Polygeist stage's /usr/lib/llvm-16 runtime is
+# The final image is 24.04; the Polygeist stage's /usr/lib/llvm-18 runtime is
 # copied over (jammy binaries run fine on noble's newer glibc).
 
 # ---------------------------------------------------------------- polygeist
-FROM ubuntu:22.04 AS polygeist
+FROM ubuntu:24.04 AS polygeist
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl gnupg lsb-release software-properties-common \
     git cmake ninja-build build-essential python3 zlib1g-dev libzstd-dev
-RUN curl -fsSL https://apt.llvm.org/llvm.sh -o /tmp/llvm.sh \
-    && chmod +x /tmp/llvm.sh \
-    && /tmp/llvm.sh 16 \
-    && apt-get install -y --no-install-recommends \
-       libmlir-16-dev mlir-16-tools clang-16 libclang-16-dev libpolly-16-dev
-# Shallow clone; the llvm-project submodule is NOT initialized — we build
-# against the apt LLVM 16 above instead of the pinned submodule.
-RUN git clone --depth 1 https://github.com/llvm/Polygeist /opt/polygeist-src
+# Ubuntu 24.04 (noble) ships LLVM/MLIR 18 in its own repositories, and
+# Polygeist's submodule pins LLVM 18 — so install the distro packages
+# directly. apt.llvm.org's snapshot of 18 conflicts with noble's native 18
+# (libllvm18 Breaks the older llvm-18-dev), so it is deliberately not used
+# here; the LLVM-22 builder stage below is the only apt.llvm.org consumer.
+RUN apt-get install -y --no-install-recommends \
+      llvm-18-dev libmlir-18-dev mlir-18-tools clang-18 libclang-18-dev \
+      libpolly-18-dev lld-18
+# Shallow clone. The llvm-project submodule is checked out shallowly too:
+# cgeist's cmake needs a handful of clang driver *source* files from it, but
+# LLVM itself still comes prebuilt from apt — nothing from the submodule is
+# compiled as LLVM.
+RUN git clone --depth 1 https://github.com/llvm/Polygeist /opt/polygeist-src \
+    && git -C /opt/polygeist-src submodule update --init --depth 1 llvm-project
 RUN cmake -S /opt/polygeist-src -B /opt/polygeist-build -G Ninja \
       -DCMAKE_BUILD_TYPE=Release \
-      -DMLIR_DIR=/usr/lib/llvm-16/lib/cmake/mlir \
-      -DClang_DIR=/usr/lib/llvm-16/lib/cmake/clang \
-      -DLLVM_DIR=/usr/lib/llvm-16/lib/cmake/llvm \
-      -DPOLYGEIST_USE_LINKER=lld-16 \
+      -DCMAKE_C_COMPILER=clang-18 \
+      -DCMAKE_CXX_COMPILER=clang++-18 \
+      -DMLIR_DIR=/usr/lib/llvm-18/lib/cmake/mlir \
+      -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang \
+      -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+      -DPOLYGEIST_USE_LINKER=lld-18 \
     && cmake --build /opt/polygeist-build --target cgeist polygeist-opt \
     && mkdir -p /opt/polygeist/bin \
     && cp /opt/polygeist-build/bin/cgeist /opt/polygeist-build/bin/polygeist-opt \
@@ -73,8 +81,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgmp10 libmpfr6 libmpc3 libntl44 libzstd1 zlib1g \
     libfreetype6 libfontconfig1 ca-certificates \
     && rm -rf /var/lib/apt/lists/*
-# Polygeist runtime: cgeist/polygeist-opt link the shared LLVM 16 libraries.
-COPY --from=polygeist /usr/lib/llvm-16 /usr/lib/llvm-16
+# Polygeist runtime: cgeist/polygeist-opt link the shared LLVM 18 libraries.
+COPY --from=polygeist /usr/lib/llvm-18 /usr/lib/llvm-18
 COPY --from=polygeist /opt/polygeist/bin/cgeist /opt/polygeist/bin/polygeist-opt /usr/local/bin/
 COPY --from=builder /src/target/release/analyzer /usr/local/bin/analyzer
 ENTRYPOINT ["/usr/local/bin/analyzer"]
