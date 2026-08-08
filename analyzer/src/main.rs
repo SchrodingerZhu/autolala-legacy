@@ -12,6 +12,7 @@ use std::num::NonZero;
 use std::{collections::HashMap, io::Read, path::PathBuf};
 use tracing::{debug, error, info};
 mod isl;
+mod polygeist;
 mod salt;
 mod utils;
 
@@ -138,6 +139,45 @@ struct Options {
 
     #[arg(long)]
     start_from_loop: bool,
+
+    /// Treat the input as C source: lower it with Polygeist's `cgeist`
+    /// (resolved from PATH) before analysis. Implied when --input ends in
+    /// .c/.cc/.cpp/.cxx. Requires --input (cgeist reads a file).
+    #[arg(long)]
+    c_input: bool,
+}
+
+impl Options {
+    fn wants_c_input(&self) -> bool {
+        self.c_input
+            || self
+                .input
+                .as_ref()
+                .and_then(|p| p.extension())
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| matches!(e, "c" | "cc" | "cpp" | "cxx"))
+    }
+}
+
+/// Reads the analysis input as MLIR text; for C input, runs the Polygeist
+/// bridge first. Returns the text and whether it came from Polygeist (in
+/// which case the parsed module still carries foreign attributes to strip).
+fn obtain_mlir_source(options: &Options, reader: &mut dyn Read) -> anyhow::Result<(String, bool)> {
+    if options.wants_c_input() {
+        let path = options
+            .input
+            .as_ref()
+            .ok_or_else(|| anyhow!("--c-input requires --input: cgeist reads a file, not stdin"))?;
+        let text = polygeist::run_polygeist(path, options.target_function.as_deref())
+            .map_err(|e| anyhow!("polygeist bridge failed: {e}"))?;
+        debug!("Polygeist produced {} bytes of MLIR", text.len());
+        Ok((text, true))
+    } else {
+        let mut source = String::new();
+        let bytes = reader.read_to_string(&mut source)?;
+        debug!("Read {} bytes", bytes);
+        Ok((source, false))
+    }
 }
 
 fn extract_target<'bctx, 'ctx, 'dom>(
@@ -253,11 +293,15 @@ fn main_entry() -> anyhow::Result<()> {
             save_distro,
         } => AnalysisContext::start_with_args(barvinok_arg.as_slice(), |context| {
             let context = &context;
-            let mut source = String::new();
-            let bytes = reader.read_to_string(&mut source)?;
-            debug!("Read {} bytes", bytes);
+            let (source, from_c) = obtain_mlir_source(&options, &mut reader)?;
+            if from_c {
+                context.mcontext().set_allow_unregistered_dialects(true);
+            }
             let module = Module::parse(context.mcontext(), &source)
                 .ok_or_else(|| anyhow!("Failed to parse module"))?;
+            if from_c {
+                polygeist::strip_module(&module);
+            }
             debug!("Parsed module: {}", module.as_operation());
             let dom = DominanceInfo::new(&module);
             let tree = extract_target(&module, &options, context, &dom)?;
@@ -380,13 +424,16 @@ fn main_entry() -> anyhow::Result<()> {
         }),
         Method::Salt { block_size } => AnalysisContext::start(|context| {
             let context = &context;
-            let mut source = String::new();
-            let bytes = reader.read_to_string(&mut source)?;
-
-            debug!("Read {} bytes", bytes);
+            let (source, from_c) = obtain_mlir_source(&options, &mut reader)?;
+            if from_c {
+                context.mcontext().set_allow_unregistered_dialects(true);
+            }
 
             let module = Module::parse(context.mcontext(), &source)
                 .ok_or_else(|| anyhow!("Failed to parse module"))?;
+            if from_c {
+                polygeist::strip_module(&module);
+            }
 
             debug!("Parsed module: {}", module.as_operation());
 

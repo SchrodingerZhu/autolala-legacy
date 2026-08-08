@@ -82,7 +82,10 @@ pub fn strip_foreign_attributes(op: OperationRef) {
         unsafe {
             mlir_sys::mlirOperationRemoveDiscardableAttributeByName(
                 op.to_raw(),
-                mlir_sys::mlirStringRefCreate(name.as_ptr() as *const _, name.len()),
+                mlir_sys::MlirStringRef {
+                    data: name.as_ptr() as *const _,
+                    length: name.len(),
+                },
             );
         }
     }
