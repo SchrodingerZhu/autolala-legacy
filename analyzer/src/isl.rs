@@ -22,6 +22,7 @@ use raffine::{
 };
 use std::path::Path;
 use std::{
+    collections::HashSet,
     collections::hash_map::Entry,
     num::NonZero,
     time::{Duration, Instant},
@@ -71,7 +72,7 @@ fn align_sets<'i, 'a: 'i>(
         let mut s = i
             .clone()
             .insert_dims(DimType::Out, length, longest_dim - length)?;
-        for j in length..longest.n_dim()? {
+        for j in length..longest_dim {
             // add constraint eq 0
             let constraint = Constraint::new_equality(local_space.clone())?.set_coefficient_si(
                 DimType::Out,
@@ -79,13 +80,24 @@ fn align_sets<'i, 'a: 'i>(
                 1,
             )?;
             s = s.add_constraint(constraint)?;
+            // Padding dims must carry the longest statement's dim names, or
+            // the union erases the names and downstream output prints
+            // auto-generated ones that nothing else can refer to.
+            if let Some(name) = space.get_dim_name(DimType::Out, j as u32)? {
+                let name = name.to_string();
+                s = s.set_dim_name(DimType::Out, j as u32, &name)?;
+            }
         }
         if add_dim_constraint {
             let current_dim_eq_i = Constraint::new_equality(local_space.clone())?
                 .set_coefficient_si(DimType::Out, depth as i32, 1)?
                 .set_constant_si(-(idx as i32))?;
-            *i = s.add_constraint(current_dim_eq_i)?;
+            s = s.add_constraint(current_dim_eq_i)?;
         }
+        // The aligned copy must always be written back; writing it back only
+        // when the dim constraint was requested silently discarded the
+        // alignment for the `add_dim_constraint == false` (if/else) callers.
+        *i = s;
     }
     Ok(())
 }
@@ -110,13 +122,20 @@ fn align_maps<'i, 'a: 'i>(
                 1,
             )?;
             s = s.add_constraint(constraint)?;
+            // See align_sets: padding dims keep the longest statement's names.
+            if let Some(name) = space.get_dim_name(DimType::In, j as u32)? {
+                let name = name.to_string();
+                s = s.set_dim_name(DimType::In, j as u32, &name)?;
+            }
         }
         if add_dim_constraint {
             let current_dim_eq_i = Constraint::new_equality(local_space.clone())?
                 .set_coefficient_si(DimType::In, depth as i32, 1)?
                 .set_constant_si(-(idx as i32))?;
-            *i = s.add_constraint(current_dim_eq_i)?;
+            s = s.add_constraint(current_dim_eq_i)?;
         }
+        // Always write the aligned copy back (see align_sets).
+        *i = s;
     }
     Ok(())
 }
@@ -197,6 +216,13 @@ fn get_timestamp_space_impl<'a, 'b: 'a>(
                 )?)
         }
         Tree::Block(stmts) => {
+            if stmts.is_empty() {
+                // An empty block contributes no timestamps; erroring here
+                // (the old "no sets found") rejected programs with empty
+                // branches instead of treating them as empty schedules.
+                let space = Space::set(context.bcontext(), num_params as u32, depth as u32)?;
+                return Ok(Set::empty(space)?);
+            }
             let mut sub_sets = stmts
                 .iter()
                 .map(|stmt| {
@@ -342,6 +368,20 @@ fn get_access_map_impl<'a, 'b: 'a>(
             )?)
         }
         Tree::Block(stmts) => {
+            if stmts.is_empty() {
+                // Empty block: no accesses. Mirror the range layout used by
+                // Tree::Access (memref id + padded array dims + optional set
+                // tag) so the empty map unions cleanly with siblings.
+                let range_dims =
+                    (max_array_dim + 1 + usize::from(num_sets.get() > 1)) as u32;
+                let space = Space::new(
+                    context.bcontext(),
+                    num_params as u32,
+                    depth as u32,
+                    range_dims,
+                )?;
+                return Ok(Map::empty(space)?);
+            }
             let mut sub_maps = stmts
                 .iter()
                 .map(|stmt| {
@@ -644,6 +684,13 @@ impl<'isl, 'mlir, 'map> ExprConverter<'isl, 'mlir, 'map> {
 #[derive(Clone, Debug)]
 pub struct RIProcessor<'a> {
     pw_qpoly: PiecewiseQuasiPolynomial<'a>,
+    /// True support of the counted relation (its domain set). The cardinality
+    /// pw_qpolynomial may legally represent "count = 0" points *inside* a
+    /// coalesced piece cell (isl is free to choose that representation), so a
+    /// piece domain can strictly contain the accesses that actually reuse.
+    /// Every piece is restricted to this support before it is counted;
+    /// otherwise zero-count points are tallied as warm accesses.
+    support: Set<'a>,
 }
 
 #[derive(Clone, Debug)]
@@ -659,8 +706,8 @@ pub struct DistItem<'a> {
 }
 
 impl<'a> RIProcessor<'a> {
-    pub fn new(pw_qpoly: PiecewiseQuasiPolynomial<'a>) -> Self {
-        RIProcessor { pw_qpoly }
+    pub fn new(pw_qpoly: PiecewiseQuasiPolynomial<'a>, support: Set<'a>) -> Self {
+        RIProcessor { pw_qpoly, support }
     }
     pub fn get_all_pieces(&self) -> Result<Box<[Piece<'a>]>, barvinok::Error> {
         let mut pieces: Vec<Piece<'_>> = Vec::new();
@@ -683,8 +730,15 @@ impl<'a> RIProcessor<'a> {
         Ok(pieces.into_boxed_slice())
     }
     fn get_processed_pieces(&self) -> Result<Box<[Piece<'a>]>, barvinok::Error> {
-        let mut pieces = self.get_all_pieces()?;
-        for piece in pieces.iter_mut() {
+        let mut pieces = Vec::new();
+        for mut piece in self.get_all_pieces()?.into_vec() {
+            // Restrict each piece to the true support of the counted
+            // relation and drop pieces that become empty (see the `support`
+            // field doc for why the raw piece domains over-approximate).
+            piece.domain = piece.domain.intersect(self.support.clone())?;
+            if piece.domain.clone().is_empty()? {
+                continue;
+            }
             let involved_dims = piece.involved_input_dims()?;
             // move involved_dims into params space (currently for domain only)
             let mut domain = piece.domain.clone();
@@ -700,8 +754,9 @@ impl<'a> RIProcessor<'a> {
                 )?;
             }
             piece.domain = domain;
+            pieces.push(piece);
         }
-        Ok(pieces)
+        Ok(pieces.into_boxed_slice())
     }
     pub fn get_distribution(&self) -> Result<Box<[DistItem<'a>]>, barvinok::Error> {
         let mut pieces = self.get_processed_pieces()?;
@@ -724,32 +779,87 @@ impl<'a> Piece<'a> {
     pub fn cardinality(&self) -> Result<PiecewiseQuasiPolynomial<'a>, barvinok::Error> {
         self.domain().cardinality()
     }
+    /// Input dimensions the value quasi-polynomial *actually* uses, judged
+    /// from its rendered expression. `isl_qpolynomial_involves_dims` also
+    /// reports dims that only occur in unused div definitions left over from
+    /// earlier computations, which would needlessly expose extra iterators as
+    /// distribution parameters. Unnamed dims (which the rendering cannot
+    /// identify) fall back to the conservative isl answer.
     fn involved_input_dims(&self) -> Result<Box<[u32]>, barvinok::Error> {
+        let space = self.qpoly.get_space()?;
+        let rendered = convert_quasi_poly(self.qpoly.clone())?;
+        // `false`: skip function-name symbols (e.g. `floor`) but still
+        // collect the symbols inside their arguments.
+        let symbols = rendered
+            .to_expression()
+            .get_all_symbols(false)
+            .iter()
+            .map(|s| s.get_stripped_name().to_string())
+            .collect::<HashSet<String>>();
         let dims = self.qpoly.get_dim(DimType::In)?;
         let mut res = Vec::with_capacity(dims as usize);
         for i in 0..dims {
-            if self.qpoly.involves_dims(DimType::In, i, 1)? {
-                res.push(i);
+            match space.get_dim_name(DimType::In, i)? {
+                Some(name) => {
+                    if symbols.contains(name) {
+                        res.push(i);
+                    }
+                }
+                None => {
+                    if self.qpoly.involves_dims(DimType::In, i, 1)? {
+                        res.push(i);
+                    }
+                }
             }
         }
         Ok(res.into_boxed_slice())
     }
 }
 
-pub fn create_table(
-    dist: &[DistItem],
-    total: PiecewiseQuasiPolynomial<'_>,
-    infinite_repeat: bool,
-) -> Result<Table> {
+/// Extract the unique piece of the total-count pw_qpolynomial together with
+/// its domain guard. A single piece keeps its guard (the value is only valid
+/// on that domain), and a genuinely piecewise total cannot be collapsed into
+/// one rational polynomial, so that case is an explicit error instead of the
+/// old behavior of silently keeping whichever piece was visited last.
+fn total_count_piece<'a>(
+    total: &PiecewiseQuasiPolynomial<'a>,
+) -> Result<(QuasiPolynomial<'a>, Set<'a>)> {
+    let mut piece = None;
+    let mut num_pieces = 0usize;
+    total.foreach_piece(|qpoly, domain| {
+        num_pieces += 1;
+        if piece.is_none() {
+            piece = Some((qpoly, domain));
+        }
+        Ok(())
+    })?;
+    match num_pieces {
+        0 => Err(anyhow::anyhow!("no total count found")),
+        1 => Ok(piece.expect("one piece")),
+        n => Err(anyhow::anyhow!(
+            "total count is piecewise ({n} pieces); cannot collapse it into a single polynomial"
+        )),
+    }
+}
+
+/// The constraint part of a set's textual form (empty for the universe).
+fn domain_guard(domain: &Set<'_>) -> String {
+    let raw = format!("{domain:?}");
+    raw.split("{  : ")
+        .nth(1)
+        .unwrap_or_default()
+        .split(" }")
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+pub fn create_table(dist: &[DistItem], total: PiecewiseQuasiPolynomial<'_>) -> Result<Table> {
     use comfy_table::ContentArrangement;
     use comfy_table::modifiers::UTF8_ROUND_CORNERS;
     use comfy_table::presets::UTF8_FULL;
-    let mut total_count = None;
-    total.foreach_piece(|qpoly, _| {
-        total_count.replace(qpoly);
-        Ok(())
-    })?;
-    let total_count = total_count.ok_or_else(|| anyhow::anyhow!("no total count found"))?;
+    let (total_count, _total_domain) = total_count_piece(&total)?;
     let total_count_poly = convert_quasi_poly(total_count)?;
     let mut table = Table::new();
     table
@@ -765,47 +875,10 @@ pub fn create_table(
         item.cardinality.foreach_piece(|qpoly, domain| {
             let poly = convert_quasi_poly(qpoly.clone())?;
             let count = format!("{poly}");
-            let range = format!("{domain:?}");
-            let range = range
-                .split("{  : ")
-                .nth(1)
-                .unwrap_or_default()
-                .split(" }")
-                .next()
-                .unwrap_or_default();
-            // L'Hôpital's rule
-            let portion = if infinite_repeat {
-                tracing::debug!("applying L'Hôpital's rule for {poly}/{total_count_poly}");
-                let poly_var = poly.get_variables().iter().position(|x| {
-                    x.get_id()
-                        .map(|x| x.get_stripped_name() == "R")
-                        .unwrap_or_default()
-                });
-                if poly.is_zero() || poly_var.is_none() {
-                    table.add_row([&value_str, &count, range, "0"]);
-                    return Ok(());
-                }
-                let total_var = total_count_poly
-                    .get_variables()
-                    .iter()
-                    .position(|x| {
-                        x.get_id()
-                            .map(|x| x.get_stripped_name() == "R")
-                            .unwrap_or_default()
-                    })
-                    .unwrap();
-                let poly = poly.derivative(poly_var.unwrap());
-                let total = total_count_poly.derivative(total_var);
-                if total.is_zero() {
-                    table.add_row([&value_str, &count, range, "∞"]);
-                    return Ok(());
-                }
-                field.div(&poly, &total)
-            } else {
-                field.div(&poly, &total_count_poly)
-            };
+            let range = domain_guard(&domain);
+            let portion = field.div(&poly, &total_count_poly);
             let portion_str = format!("{portion}");
-            table.add_row([&value_str, &count, range, &portion_str]);
+            table.add_row([&value_str, &count, &range, &portion_str]);
             Ok(())
         })?;
     }
@@ -816,6 +889,22 @@ struct QpolyConverter<'a> {
     ring: IntegerRing,
     field: RationalPolynomialField<IntegerRing, u32>,
     space: Space<'a>,
+}
+
+/// The `floor` function symbol used to render isl div dimensions. Created
+/// once, with a numeric evaluation hook, so that expressions containing
+/// floors remain evaluable by `evaluate_poly` (symbolica has no builtin
+/// floor). The `OnceLock` avoids re-registering the hook, which symbolica
+/// would treat as redefining the symbol's attributes.
+fn floor_symbol() -> symbolica::atom::Symbol {
+    use symbolica::atom::EvaluationInfo;
+    static FLOOR: std::sync::OnceLock<symbolica::atom::Symbol> = std::sync::OnceLock::new();
+    *FLOOR.get_or_init(|| {
+        symbol!(
+            "floor",
+            eval = EvaluationInfo::new().register(|args: &[f64]| args[0].floor())
+        )
+    })
 }
 
 fn convert_quasi_poly<'a>(
@@ -842,8 +931,13 @@ impl<'a> QpolyConverter<'a> {
         self.field.div(&num, &denom)
     }
 
+    /// The rational value of an isl affine expression:
+    /// `constant + Σ coeff·dim + Σ coeff·floor(nested div)`.
+    /// The `*_val` getters already return fully divided rational values, so
+    /// no further division by `get_denominator_val` may be applied (doing so
+    /// was the double-division bug that turned `floor((i+1)/8)` into
+    /// `(i+1)/64`).
     fn aff_to_rational_poly(&self, aff: Affine<'a>) -> Result<Poly, barvinok::Error> {
-        let den = self.value_to_rational_poly(aff.get_denominator_val()?);
         let mut num = self.field.zero();
         let cst = self.value_to_rational_poly(aff.get_constant_val()?);
         if !cst.is_zero() {
@@ -857,7 +951,8 @@ impl<'a> QpolyConverter<'a> {
                 if coeff.is_zero() {
                     continue;
                 }
-                let v = Atom::var(symbol!(self.space.get_dim_name(ty, i)?.unwrap()));
+                let name = self.space.get_dim_name(ty, i)?.unwrap_or("unnamed");
+                let v = Atom::var(symbol!(name));
                 let term = self.field.mul(
                     &coeff,
                     &v.to_rational_polynomial(&self.ring, &self.ring, None),
@@ -865,26 +960,76 @@ impl<'a> QpolyConverter<'a> {
                 num = self.field.add(&num, &term);
             }
         }
-        Ok(self.field.div(&num, &den))
+        // An affine may reference (earlier) div dimensions; each use is a
+        // coefficient times the floor of that div's own affine.
+        let div_dims = aff.dim(DimType::Div)?;
+        for i in 0..div_dims {
+            let coeff = self.value_to_rational_poly(aff.get_coefficient_val(DimType::Div, i as i32)?);
+            if coeff.is_zero() {
+                continue;
+            }
+            let div_aff = aff
+                .get_div(i as i32)
+                .ok_or(barvinok::Error::VariablePositionOutOfBounds)?;
+            let div = self.floor_div(div_aff)?;
+            num = self.field.add(&num, &self.field.mul(&coeff, &div));
+        }
+        Ok(num)
+    }
+
+    /// An isl div dimension is `floor(<affine>)`; dropping the floor turns an
+    /// integer-valued step term into a wrong rational value. Symbolica 2.2
+    /// has no builtin floor symbol, so the floor is rendered as an opaque
+    /// `floor(...)` function atom; `to_rational_polynomial` maps such atoms
+    /// to fresh polynomial variables (PolyVariable::Function), which is the
+    /// minimal faithful counterpart of the reference's `FormulaExpr::floor`.
+    /// The symbol carries a numeric evaluation hook (see [`floor_symbol`]) so
+    /// the miss-ratio distribution path can still evaluate the expression at
+    /// integer points. When the affine is already integral (denominator 1)
+    /// the floor is the identity, and the plain affine is kept so the result
+    /// stays a pure polynomial in that case.
+    fn floor_div(&self, aff: Affine<'a>) -> Result<Poly, barvinok::Error> {
+        let denominator = aff.get_denominator_val()?;
+        let inner = self.aff_to_rational_poly(aff)?;
+        if denominator.is_one()? {
+            return Ok(inner);
+        }
+        let atom = symbolica::function!(Atom::var(floor_symbol()), inner.to_expression());
+        Ok(atom.to_rational_polynomial(&self.ring, &self.ring, None))
     }
 
     fn term_to_rational_poly(&self, term: Term<'a>) -> std::result::Result<Poly, barvinok::Error> {
         let mut poly = self.value_to_rational_poly(term.coefficient()?);
-        let params = self.space.dim(DimType::Param)?;
-        let in_dims = self.space.dim(DimType::In)?;
-        let dims = std::iter::repeat_n(DimType::Param, params as usize)
-            .enumerate()
-            .chain(std::iter::repeat_n(DimType::Out, in_dims as usize).enumerate());
-        for (i, ty) in dims {
-            let exp = term.exponent(ty, i as u32)?;
-            if exp > 0 {
-                let ty = if matches!(ty, DimType::Param) {
-                    DimType::Param
+        // isl terms expose their monomial exponents on the *Param* and *Out*
+        // ("set") slots only, while the enclosing quasi-polynomial space
+        // names those same set dims as In dims. Counting via the space's In
+        // slot silently dropped set-dim monomials whenever the term carried
+        // more set dims than the space had In dims (a value `-7 + 2*i1`
+        // rendered as `-5`), so both the counts and the exponent reads come
+        // from the term itself; only the *names* come from the space (In
+        // first, then Out for genuine set spaces), bounds-checked because the
+        // term may have more set dims than the space names.
+        let space_in_dims = self.space.dim(DimType::In)?;
+        let space_out_dims = self.space.dim(DimType::Out)?;
+        for ty in [DimType::Param, DimType::Out] {
+            let dims = term.dim(ty)?;
+            for i in 0..dims {
+                let exp = term.exponent(ty, i)?;
+                if exp == 0 {
+                    continue;
+                }
+                let mut name = None;
+                if matches!(ty, DimType::Param) {
+                    name = self.space.get_dim_name(DimType::Param, i)?;
                 } else {
-                    DimType::In
-                };
-                let name = self.space.get_dim_name(ty, i as u32)?.unwrap();
-                let symbol = symbol!(name);
+                    if i < space_in_dims {
+                        name = self.space.get_dim_name(DimType::In, i)?;
+                    }
+                    if name.is_none() && i < space_out_dims {
+                        name = self.space.get_dim_name(DimType::Out, i)?;
+                    }
+                }
+                let symbol = symbol!(name.unwrap_or("unnamed"));
                 let exp = Atom::num(exp as i64);
                 let atom = Atom::var(symbol).pow(exp);
                 let atom = atom.to_rational_polynomial(&self.ring, &self.ring, None);
@@ -896,7 +1041,7 @@ impl<'a> QpolyConverter<'a> {
             let exp = term.exponent(DimType::Div, i)?;
             if exp > 0 {
                 let div_aff = term.get_div(i)?;
-                let div_poly = self.aff_to_rational_poly(div_aff)?;
+                let div_poly = self.floor_div(div_aff)?;
                 let p = self.field.pow(&div_poly, exp as u64);
                 poly = self.field.mul(&poly, &p);
             }
@@ -1021,13 +1166,15 @@ impl<'a> ConvertedDistItem<'a> {
 }
 
 fn evaluate_poly<'a>(poly: &Poly, point: &Point<'a>) -> Result<f64> {
-    let variables = poly.get_variables();
-    let name_map = variables
+    let expr = poly.to_expression();
+    // Collect symbols from the full expression rather than from the
+    // polynomial's variable list: dims that only occur inside rendered
+    // `floor(...)` atoms are part of an opaque function variable and would
+    // otherwise be missing from the evaluation map.
+    let name_map = expr
+        .get_all_symbols(false)
         .iter()
-        .filter_map(|x| {
-            x.get_id()
-                .map(|x| (x.get_stripped_name().to_string(), Atom::var(x)))
-        })
+        .map(|x| (x.get_stripped_name().to_string(), Atom::var(*x)))
         .collect::<AHashMap<String, Atom>>();
     let space = point.get_space()?;
     let dims = space.dim(DimType::Out)?;
@@ -1042,14 +1189,12 @@ fn evaluate_poly<'a>(poly: &Poly, point: &Point<'a>) -> Result<f64> {
         let val = point.get_coordinate_val(DimType::Out, i as i32)?.to_f64();
         const_map.insert(atom, val);
     }
-    let expr = poly.to_expression();
     expr.evaluate(&const_map)
         .map_err(|msg| anyhow::anyhow!("failed to evaluate polynomial: {msg}"))
 }
 
 fn convert_bounded_set<'a>(mut set: Set<'a>) -> Result<Set<'a>> {
-    let mut num_params = set.n_param()?;
-    let mut infinite_repeat_dim = None;
+    let num_params = set.n_param()?;
     for i in 0..num_params {
         let name = set.get_dim_name(DimType::Param, i)?.unwrap_or_default();
         if name.starts_with("p") {
@@ -1057,13 +1202,6 @@ fn convert_bounded_set<'a>(mut set: Set<'a>) -> Result<Set<'a>> {
                 "all parameters must be instantiated for numerical analysis"
             ));
         }
-        if name == "R" {
-            infinite_repeat_dim = Some(i);
-        }
-    }
-    if let Some(dim) = infinite_repeat_dim {
-        set = set.remove_dims(DimType::Param, dim, 1)?;
-        num_params -= 1;
     }
     // move all parameters to set space
     set = set.move_dims(DimType::Out, 0, DimType::Param, 0, num_params)?;
@@ -1076,9 +1214,8 @@ fn convert_bounded_set<'a>(mut set: Set<'a>) -> Result<Set<'a>> {
 pub fn get_distro<'a>(
     dist: &[DistItem<'a>],
     total: PiecewiseQuasiPolynomial<'a>,
-    infinite_repeat: bool,
 ) -> Result<Box<[(isize, f64)]>> {
-    let dist = convert_dist(dist, total, infinite_repeat)?;
+    let dist = convert_dist(dist, total)?;
     let mut result = AHashMap::new();
     for item in dist.iter() {
         item.add_to_dist(&mut result)?;
@@ -1092,14 +1229,8 @@ pub fn get_distro<'a>(
 fn convert_dist<'a>(
     dist: &[DistItem<'a>],
     total: PiecewiseQuasiPolynomial<'a>,
-    infinite_repeat: bool,
 ) -> Result<Box<[ConvertedDistItem<'a>]>> {
-    let mut total_count = None;
-    total.foreach_piece(|qpoly, _| {
-        total_count.replace(qpoly);
-        Ok(())
-    })?;
-    let total_count = total_count.ok_or_else(|| anyhow::anyhow!("no total count found"))?;
+    let (total_count, _total_domain) = total_count_piece(&total)?;
     let total_count_poly = convert_quasi_poly(total_count)?;
     let mut output = Vec::new();
     let ring = IntegerRing::new();
@@ -1112,34 +1243,7 @@ fn convert_dist<'a>(
                 return Ok(());
             }
             let poly = convert_quasi_poly(qpoly.clone())?;
-            // L'Hôpital's rule
-            let portion = if infinite_repeat {
-                tracing::debug!("applying L'Hôpital's rule for {poly}/{total_count_poly}");
-                let poly_var = poly.get_variables().iter().position(|x| {
-                    x.get_id()
-                        .map(|x| x.get_stripped_name() == "R")
-                        .unwrap_or_default()
-                });
-                if poly.is_zero() || poly_var.is_none() {
-                    return Ok(());
-                }
-                let Some(total_var) = total_count_poly.get_variables().iter().position(|x| {
-                    x.get_id()
-                        .map(|x| x.get_stripped_name() == "R")
-                        .unwrap_or_default()
-                }) else {
-                    res = Err(anyhow::anyhow!("no total var found"));
-                    return Ok(());
-                };
-                let poly = poly.derivative(poly_var.unwrap());
-                let total = total_count_poly.derivative(total_var);
-                if total.is_zero() {
-                    return Ok(());
-                }
-                field.div(&poly, &total)
-            } else {
-                field.div(&poly, &total_count_poly)
-            };
+            let portion = field.div(&poly, &total_count_poly);
             match convert_bounded_set(domain) {
                 Ok(domain) => {
                     let item = ConvertedDistItem {
@@ -1172,16 +1276,10 @@ struct BarvinokResult {
 pub fn create_json_output<'a>(
     dist: &[DistItem<'a>],
     total: PiecewiseQuasiPolynomial<'a>,
-    infinite_repeat: bool,
     start_time: Instant,
 ) -> Result<String> {
-    let distribution = get_distro(dist, total.clone(), infinite_repeat).unwrap_or_default();
-    let mut total_count = None;
-    total.foreach_piece(|qpoly, _| {
-        total_count.replace(qpoly);
-        Ok(())
-    })?;
-    let total_count = total_count.ok_or_else(|| anyhow::anyhow!("no total count found"))?;
+    let distribution = get_distro(dist, total.clone()).unwrap_or_default();
+    let (total_count, total_domain) = total_count_piece(&total)?;
     let total_count_poly = convert_quasi_poly(total_count)?;
     let mut ri_values = Vec::new();
     let mut symbol_ranges = Vec::new();
@@ -1195,54 +1293,11 @@ pub fn create_json_output<'a>(
         item.cardinality.foreach_piece(|qpoly, domain| {
             let poly = convert_quasi_poly(qpoly.clone())?;
             let count = format!("{}", poly.to_expression().printer(PrintOptions::latex()));
-            let range = format!("{domain:?}");
-            let range = range
-                .split("{  : ")
-                .nth(1)
-                .unwrap_or_default()
-                .split(" }")
-                .next()
-                .unwrap_or_default();
-            // L'Hôpital's rule
-            let portion = if infinite_repeat {
-                tracing::debug!("applying L'Hôpital's rule for {poly}/{total_count_poly}");
-                let poly_var = poly.get_variables().iter().position(|x| {
-                    x.get_id()
-                        .map(|x| x.get_stripped_name() == "R")
-                        .unwrap_or_default()
-                });
-                if poly.is_zero() || poly_var.is_none() {
-                    ri_values.push(value_str.clone());
-                    symbol_ranges.push(range.to_string());
-                    counts.push(count);
-                    portions.push("0".to_string());
-                    return Ok(());
-                }
-                let total_var = total_count_poly
-                    .get_variables()
-                    .iter()
-                    .position(|x| {
-                        x.get_id()
-                            .map(|x| x.get_stripped_name() == "R")
-                            .unwrap_or_default()
-                    })
-                    .unwrap();
-                let poly = poly.derivative(poly_var.unwrap());
-                let total = total_count_poly.derivative(total_var);
-                if total.is_zero() {
-                    ri_values.push(value_str.clone());
-                    symbol_ranges.push(range.to_string());
-                    counts.push(count);
-                    portions.push("∞".to_string());
-                    return Ok(());
-                }
-                field.div(&poly, &total)
-            } else {
-                field.div(&poly, &total_count_poly)
-            };
+            let range = domain_guard(&domain);
+            let portion = field.div(&poly, &total_count_poly);
             let portion_str = format!("{}", portion.to_expression().printer(PrintOptions::latex()));
             ri_values.push(value_str.clone());
-            symbol_ranges.push(range.to_string());
+            symbol_ranges.push(range);
             counts.push(count);
             portions.push(portion_str);
             Ok(())
@@ -1252,12 +1307,21 @@ pub fn create_json_output<'a>(
     let symbol_ranges = symbol_ranges.into_boxed_slice();
     let counts = counts.into_boxed_slice();
     let portions = portions.into_boxed_slice();
-    let total_count = format!(
+    let total_count_expr = format!(
         "{}",
         total_count_poly
             .to_expression()
             .printer(PrintOptions::latex())
     );
+    // A single-piece total keeps its domain guard: the expression is only
+    // valid on the piece domain, and rendering it bare would silently claim
+    // validity everywhere (e.g. outside the parameter range).
+    let guard = domain_guard(&total_domain);
+    let total_count = if guard.is_empty() {
+        total_count_expr
+    } else {
+        format!("\\left[{guard}\\right] \\Rightarrow {total_count_expr}")
+    };
     let miss_ratio_curve = MissRatioCurve::new(&distribution);
     let analysis_time = start_time.elapsed();
     let result = BarvinokResult {

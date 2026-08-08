@@ -74,6 +74,10 @@ enum Method {
         infinite_repeat: bool,
         #[arg(short = 's', long, default_value = "1")]
         num_sets: NonZero<usize>,
+        /// Abort isl computations after this many operations (0 = unlimited).
+        /// The default keeps the historical unlimited behavior.
+        #[arg(long, default_value = "0")]
+        max_operations: usize,
         #[arg(long)]
         /// path to save the raw distribution bincode
         save_distro: Option<PathBuf>,
@@ -290,9 +294,11 @@ fn main_entry() -> anyhow::Result<()> {
             symbol_lowerbound,
             infinite_repeat,
             num_sets,
+            max_operations,
             save_distro,
         } => AnalysisContext::start_with_args(barvinok_arg.as_slice(), |context| {
             let context = &context;
+            context.bcontext().set_max_operations(*max_operations);
             let (source, from_c) = obtain_mlir_source(&options, &mut reader)?;
             if from_c {
                 context.mcontext().set_allow_unregistered_dialects(true);
@@ -318,11 +324,13 @@ fn main_entry() -> anyhow::Result<()> {
                 space = space.add_constraint(constraint)?;
             }
             if *infinite_repeat {
-                let num_params = space.dim(barvinok::DimType::Param)?;
-                space = space
-                    .insert_dims(barvinok::DimType::Out, 0, 1)?
-                    .insert_dims(barvinok::DimType::Param, num_params, 1)?
-                    .set_dim_name(barvinok::DimType::Param, num_params, "R")?;
+                // Run-twice method: instead of a symbolic repeat count R
+                // (whose portions needed L'Hôpital limits), materialize one
+                // extra period by prepending a timestamp dim bounded to
+                // [0, 2). The second copy (leading dim == 1) observes a full
+                // prior period, so its reuse intervals are the steady-state
+                // ones, including period-boundary wraparound reuses.
+                space = space.insert_dims(barvinok::DimType::Out, 0, 1)?;
                 let local_space: LocalSpace = space.get_space()?.try_into()?;
                 let lb = Constraint::new_inequality(local_space.clone())?.set_coefficient_si(
                     barvinok::DimType::Out,
@@ -331,15 +339,8 @@ fn main_entry() -> anyhow::Result<()> {
                 )?;
                 let ub = Constraint::new_inequality(local_space.clone())?
                     .set_coefficient_si(barvinok::DimType::Out, 0, -1)?
-                    .set_coefficient_si(barvinok::DimType::Param, num_params as i32, 1)?
-                    .set_constant_si(-1)?;
-                let repeat_lb = Constraint::new_inequality(local_space.clone())?
-                    .set_coefficient_si(barvinok::DimType::Param, num_params as i32, 1)?
-                    .set_constant_si(-2)?;
-                space = space
-                    .add_constraint(lb)?
-                    .add_constraint(ub)?
-                    .add_constraint(repeat_lb)?;
+                    .set_constant_si(1)?;
+                space = space.add_constraint(lb)?.add_constraint(ub)?;
                 debug!("space with infinite repeat: {space:?}");
             }
             space = isl::ensure_set_name(space)?;
@@ -351,11 +352,9 @@ fn main_entry() -> anyhow::Result<()> {
                 *num_sets,
             )?;
             if *infinite_repeat {
-                let num_params = access_map.get_space()?.dim(barvinok::DimType::Param)?;
-                access_map = access_map
-                    .insert_dims(barvinok::DimType::In, 0, 1)?
-                    .insert_dims(barvinok::DimType::Param, num_params, 1)?
-                    .set_dim_name(barvinok::DimType::Param, num_params, "R")?;
+                // The repeat dim carries no constraints here; intersecting
+                // with the timestamp space below bounds it to [0, 2).
+                access_map = access_map.insert_dims(barvinok::DimType::In, 0, 1)?;
             }
             let access_map = isl::ensure_map_domain_name(access_map)?;
             let access_map = access_map.intersect_domain(space.clone())?;
@@ -367,30 +366,41 @@ fn main_entry() -> anyhow::Result<()> {
             let immediate_pred = same_element.intersect(gt.clone())?.lexmax()?;
             let after = immediate_pred.apply_range(lt)?;
             let ri = after.intersect(ge)?;
+            // Under --infinite-repeat keep only reuse intervals whose
+            // consuming access (the domain of `ri`) lies in the second copy
+            // (leading dim == 1): that copy has a full period of history, so
+            // its RIs are the steady-state ones. The reported access total is
+            // likewise the cardinality of the second copy only.
+            let (ri, total_space) = if *infinite_repeat {
+                let local_space: LocalSpace = space.get_space()?.try_into()?;
+                let second_copy_eq = Constraint::new_equality(local_space)?
+                    .set_coefficient_si(barvinok::DimType::Out, 0, 1)?
+                    .set_constant_si(-1)?;
+                let second_copy = space.clone().add_constraint(second_copy_eq)?;
+                (ri.intersect_domain(second_copy.clone())?, second_copy)
+            } else {
+                (ri, space.clone())
+            };
+            let ri_support = ri.clone().domain()?;
             let ri_values = ri.cardinality()?;
             debug!("Timestamp space: {:?}", space);
             debug!("Access map: {:?}", access_map);
             debug!("RI values: {:?}", ri_values);
-            let processor = isl::RIProcessor::new(ri_values);
-            let space_count = space.cardinality()?;
+            let processor = isl::RIProcessor::new(ri_values, ri_support);
+            let space_count = total_space.cardinality()?;
             let raw_distro = processor.get_distribution()?;
             if let Some(path) = save_distro {
                 isl::save_all_dist_items(&raw_distro, space_count.clone(), path)?;
                 info!("Raw distribution saved to {}", path.display());
             }
             if options.json {
-                let output = isl::create_json_output(
-                    &raw_distro,
-                    space_count,
-                    *infinite_repeat,
-                    start_time,
-                )?;
+                let output = isl::create_json_output(&raw_distro, space_count, start_time)?;
                 writeln!(writer, "{output}")?;
             } else {
-                let table = isl::create_table(&raw_distro, space_count.clone(), *infinite_repeat)?;
+                let table = isl::create_table(&raw_distro, space_count.clone())?;
                 writeln!(writer, "{table}")?;
                 writeln!(writer, "Total: {space_count:?}")?;
-                match isl::get_distro(&raw_distro, space_count, *infinite_repeat) {
+                match isl::get_distro(&raw_distro, space_count) {
                     Ok(dist) => {
                         let mut curve = denning::MissRatioCurve::new(&dist);
                         // apply associativity only when it's greater than 1
