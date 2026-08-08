@@ -87,18 +87,40 @@ RUN for i in 1 2 3 4 5; do \
       cargo fetch && break || { echo "cargo fetch attempt $i failed; retrying"; sleep 5; }; \
     done
 # rust-toolchain at the repo root pins the nightly; rustup picks it up.
-RUN cargo build --release --offline -p analyzer
+# analyzer = prediction; cachegrind-runner = simulation ground truth;
+# assoc-conv = N-way associativity conversion of prediction output.
+RUN cargo build --release --offline -p analyzer -p cachegrind-runner -p assoc-conv
 
 # ---------------------------------------------------------------- runtime
 FROM ubuntu:24.04
 ENV DEBIAN_FRONTEND=noninteractive
+# Runtime libs for the Rust tools, plus the simulation and plotting stack:
+#   valgrind (cachegrind) + clang — cachegrind-runner compiles and runs each
+#   kernel for ground-truth miss counts; python3 + the scientific stack —
+#   the plot scripts (matplotlib/numpy/pandas/scipy/seaborn/islpy/sqlite).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgmp10 libmpfr6 libmpc3 libntl44 libzstd1 zlib1g \
     libfreetype6 libfontconfig1 ca-certificates \
+    valgrind clang \
+    python3 python3-pip python3-venv sqlite3 \
+    bash coreutils \
     && rm -rf /var/lib/apt/lists/*
+# Plot dependencies in a venv (ubuntu 24.04 is PEP 668 externally-managed).
+RUN python3 -m venv /opt/venv \
+    && /opt/venv/bin/pip install --no-cache-dir \
+       matplotlib numpy pandas scipy seaborn tabulate tqdm islpy
+ENV PATH=/opt/venv/bin:/usr/local/bin:$PATH
 # cgeist/polygeist-opt are statically linked against the self-built LLVM
 # (default LLVM build = static libs), so only the two binaries travel — no
 # LLVM runtime tree to copy.
 COPY --from=polygeist /opt/polygeist/bin/cgeist /opt/polygeist/bin/polygeist-opt /usr/local/bin/
-COPY --from=builder /src/target/release/analyzer /usr/local/bin/analyzer
+COPY --from=builder /src/target/release/analyzer \
+     /src/target/release/cachegrind-runner \
+     /src/target/release/assoc-conv /usr/local/bin/
+# Benchmark harness: scripts, plot code, and the input corpus.
+COPY --from=builder /src/scripts /opt/autolala/scripts
+COPY --from=builder /src/analyzer/misc /opt/autolala/misc
+WORKDIR /opt/autolala
+# Default to the analyzer CLI; the one-click benchmark driver is invoked
+# explicitly (entrypoint overridden) until the SALT flow is wired in.
 ENTRYPOINT ["/usr/local/bin/analyzer"]
