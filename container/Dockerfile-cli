@@ -76,10 +76,18 @@ COPY . .
 # in a clean container, so rewrite it to https and let cargo fetch through
 # the system git (which honours the rewrite) — otherwise the submodules stay
 # empty and barvinok's build dies on a missing polylib source.
-ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
+ENV CARGO_NET_GIT_FETCH_WITH_CLI=true CARGO_NET_RETRY=5
 RUN git config --global url."https://repo.or.cz/".insteadOf "git://repo.or.cz/"
+# barvinok's submodules live on repo.or.cz, which TLS-flakes intermittently.
+# A reviewer builds this image once and won't retry, so absorb the flake:
+# fetch all crates + git submodules up front with retries, then build
+# offline. (Vendoring the sources would remove the host entirely; left as a
+# follow-up so the base branch doesn't carry a large vendored tree.)
+RUN for i in 1 2 3 4 5; do \
+      cargo fetch && break || { echo "cargo fetch attempt $i failed; retrying"; sleep 5; }; \
+    done
 # rust-toolchain at the repo root pins the nightly; rustup picks it up.
-RUN cargo build --release -p analyzer
+RUN cargo build --release --offline -p analyzer
 
 # ---------------------------------------------------------------- runtime
 FROM ubuntu:24.04
