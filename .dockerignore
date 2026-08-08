@@ -1,0 +1,6 @@
+target
+**/target
+.git
+results
+*.log
+container/*.log

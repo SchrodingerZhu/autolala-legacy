@@ -5,15 +5,16 @@
 //! to our parser as-is. The bridge:
 //!
 //! 1. `cgeist <input> --function=<target> -S --raise-scf-to-affine` — C to
-//!    affine MLIR, printed in Polygeist's (older) syntax;
-//! 2. `polygeist-opt --canonicalize --mlir-print-op-generic` — canonicalize
-//!    *inside the producing toolchain*, then print in the generic op form,
-//!    which is far more stable across MLIR versions than the pretty forms;
-//! 3. parse here with unregistered dialects allowed, then strip every
-//!    dialect-qualified discardable attribute Polygeist left behind
-//!    (`llvm.linkage`, `polygeist.*`, `dlti.*`, the module data layout, …)
-//!    so what remains is bare func/affine/memref/arith IR the analyzer
-//!    understands.
+//!    affine MLIR, in Polygeist's (older-LLVM) syntax;
+//! 2. `polygeist-opt --canonicalize` — canonicalize inside the producing
+//!    toolchain;
+//! 3. textually drop the top-level `module attributes { … }` dict, whose
+//!    `dlti.dl_spec` uses a `vector<2xi32>` shape the analyzer's newer MLIR
+//!    parser rejects — this has to happen *before* parsing (see
+//!    `strip_module_attributes`);
+//! 4. parse here with unregistered dialects allowed, then strip every
+//!    remaining dialect-qualified discardable attribute (`llvm.linkage`,
+//!    `polygeist.*`, …) so what's left is bare func/affine/memref/arith IR.
 //!
 //! Attributes are stripped, foreign *operations* are not: if a Polygeist
 //! dialect op survives into the target loop nest the analysis will reject it
@@ -31,7 +32,8 @@ use melior::ir::{BlockLike, Module, OperationRef, RegionLike};
 const KEPT_NAMESPACES: &[&str] = &["slap"];
 
 /// Runs `cgeist | polygeist-opt` (both resolved from PATH) over a C source
-/// file and returns generic-form MLIR text.
+/// file and returns affine-dialect MLIR text with Polygeist's module-level
+/// data-layout attributes removed.
 pub fn run_polygeist(input: &Path, target_function: Option<&str>) -> Result<String, Box<dyn Error>> {
     let function = target_function.unwrap_or("*");
     let cgeist = Command::new("cgeist")
@@ -46,8 +48,6 @@ pub fn run_polygeist(input: &Path, target_function: Option<&str>) -> Result<Stri
 
     let opt = Command::new("polygeist-opt")
         .arg("--canonicalize")
-        .arg("--allow-unregistered-dialect")
-        .arg("--mlir-print-op-generic")
         .stdin(cgeist.stdout.ok_or("cgeist produced no stdout")?)
         .stderr(Stdio::inherit())
         .output()
@@ -56,7 +56,46 @@ pub fn run_polygeist(input: &Path, target_function: Option<&str>) -> Result<Stri
     if !opt.status.success() {
         return Err(format!("polygeist-opt exited with {}", opt.status).into());
     }
-    Ok(String::from_utf8(opt.stdout)?)
+    Ok(strip_module_attributes(&String::from_utf8(opt.stdout)?))
+}
+
+/// Removes the `attributes { … }` dictionary from the top-level `module`.
+///
+/// Polygeist (built on an older LLVM) stamps the module with a `dlti.dl_spec`
+/// whose `dl_entry` values are `vector<2xi32>` — a shape the analyzer's newer
+/// MLIR parser rejects outright (it wants dense i64), so it must go *before*
+/// parsing rather than via the post-parse attribute strip. The analyzer
+/// ignores module attributes entirely, so dropping the whole dict is safe.
+/// Balanced-brace scan from the `attributes {`, because the dict spans one
+/// long line with nested `<…>`/`[…]` but a single `{…}` level.
+fn strip_module_attributes(mlir: &str) -> String {
+    const NEEDLE: &str = "module attributes {";
+    let Some(start) = mlir.find(NEEDLE) else {
+        return mlir.to_string();
+    };
+    let open = start + NEEDLE.len() - 1; // index of the '{'
+    let bytes = mlir.as_bytes();
+    let mut depth = 0usize;
+    let mut close = None;
+    for (i, &b) in bytes.iter().enumerate().skip(open) {
+        match b {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    match close {
+        // Replace `module attributes { … }` with `module`, keeping the region
+        // brace that follows.
+        Some(end) => format!("{}module{}", &mlir[..start], &mlir[end + 1..]),
+        None => mlir.to_string(),
+    }
 }
 
 /// Removes every dialect-qualified discardable attribute (except the
@@ -112,6 +151,15 @@ pub fn strip_module(module: &Module) {
 mod tests {
     use super::*;
     use melior::ir::Module;
+
+    #[test]
+    fn strips_module_attribute_dict() {
+        let src = "module attributes {dlti.dl_spec = #dlti.dl_spec<#dlti.dl_entry<i128, dense<128> : vector<2xi32>>>, llvm.target_triple = \"aarch64\"} {\n  func.func @f() { return }\n}\n";
+        let out = super::strip_module_attributes(src);
+        assert!(out.starts_with("module {"), "{out}");
+        assert!(!out.contains("dl_spec"), "{out}");
+        assert!(out.contains("func.func @f"), "{out}");
+    }
 
     #[test]
     fn strips_polygeist_attributes() {

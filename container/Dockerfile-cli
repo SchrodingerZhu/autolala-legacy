@@ -1,43 +1,43 @@
 # CLI-only image: the `analyzer` binary plus Polygeist's `cgeist` for direct
 # C input.
 #
-# Two toolchains, both from apt.llvm.org — nothing is compiled from LLVM
-# source:
-#   - Polygeist pins LLVM 18 (its llvm-project submodule), so its stage is
-#     ubuntu 22.04 + apt LLVM 18 (apt.llvm.org does not build 18 for noble).
-#   - The analyzer builds on ubuntu 24.04 + apt LLVM 22 (mlir-sys 220 /
-#     melior 0.27).
-# The final image is 24.04; the Polygeist stage's /usr/lib/llvm-18 runtime is
-# copied over (jammy binaries run fine on noble's newer glibc).
+# Two LLVM toolchains:
+#   - The analyzer builds on ubuntu 24.04 + apt.llvm.org LLVM 22 (mlir-sys
+#     220 / melior 0.27).
+#   - Polygeist pins an *unreleased* llvm-project commit whose MLIR C++ API
+#     matches no released LLVM (18.1.8 and 19 both fail to compile it), so
+#     its stage self-compiles that pinned LLVM/MLIR/Clang. cgeist and
+#     polygeist-opt link statically and travel as two binaries into the
+#     final 24.04 image.
 
 # ---------------------------------------------------------------- polygeist
 FROM ubuntu:24.04 AS polygeist
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates curl gnupg lsb-release software-properties-common \
-    git cmake ninja-build build-essential python3 zlib1g-dev libzstd-dev
-# Ubuntu 24.04 (noble) ships LLVM/MLIR 18 in its own repositories, and
-# Polygeist's submodule pins LLVM 18 — so install the distro packages
-# directly. apt.llvm.org's snapshot of 18 conflicts with noble's native 18
-# (libllvm18 Breaks the older llvm-18-dev), so it is deliberately not used
-# here; the LLVM-22 builder stage below is the only apt.llvm.org consumer.
-RUN apt-get install -y --no-install-recommends \
-      llvm-18-dev libmlir-18-dev mlir-18-tools clang-18 libclang-18-dev \
-      libpolly-18-dev lld-18
-# Shallow clone. The llvm-project submodule is checked out shallowly too:
-# cgeist's cmake needs a handful of clang driver *source* files from it, but
-# LLVM itself still comes prebuilt from apt — nothing from the submodule is
-# compiled as LLVM.
+    ca-certificates curl gnupg git cmake ninja-build build-essential \
+    python3 zlib1g-dev libzstd-dev lld clang
+# Polygeist pins an *unreleased* llvm-project commit whose MLIR C++ API
+# sits between released LLVM versions — released 18.1.8 and 19 both fail to
+# compile it (opaque-pointer and rewriter-API drift in opposite directions).
+# So this stage self-compiles Polygeist's own pinned LLVM/MLIR/Clang via the
+# standard unified in-tree build. Nothing from apt.llvm.org here.
 RUN git clone --depth 1 https://github.com/llvm/Polygeist /opt/polygeist-src \
     && git -C /opt/polygeist-src submodule update --init --depth 1 llvm-project
-RUN cmake -S /opt/polygeist-src -B /opt/polygeist-build -G Ninja \
+# Build LLVM+MLIR+Clang and Polygeist together (the project's documented
+# recipe). Host target only, Release, assertions off, no tests/examples —
+# the minimum that yields a working cgeist/polygeist-opt.
+RUN cmake -S /opt/polygeist-src/llvm-project/llvm -B /opt/polygeist-build -G Ninja \
       -DCMAKE_BUILD_TYPE=Release \
-      -DCMAKE_C_COMPILER=clang-18 \
-      -DCMAKE_CXX_COMPILER=clang++-18 \
-      -DMLIR_DIR=/usr/lib/llvm-18/lib/cmake/mlir \
-      -DClang_DIR=/usr/lib/llvm-18/lib/cmake/clang \
-      -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
-      -DPOLYGEIST_USE_LINKER=lld-18 \
+      -DCMAKE_C_COMPILER=clang \
+      -DCMAKE_CXX_COMPILER=clang++ \
+      -DLLVM_USE_LINKER=lld \
+      -DLLVM_ENABLE_PROJECTS="clang;mlir" \
+      -DLLVM_EXTERNAL_PROJECTS=polygeist \
+      -DLLVM_EXTERNAL_POLYGEIST_SOURCE_DIR=/opt/polygeist-src \
+      -DLLVM_TARGETS_TO_BUILD="host" \
+      -DLLVM_ENABLE_ASSERTIONS=OFF \
+      -DLLVM_INCLUDE_TESTS=OFF \
+      -DLLVM_INCLUDE_EXAMPLES=OFF \
     && cmake --build /opt/polygeist-build --target cgeist polygeist-opt \
     && mkdir -p /opt/polygeist/bin \
     && cp /opt/polygeist-build/bin/cgeist /opt/polygeist-build/bin/polygeist-opt \
@@ -71,6 +71,13 @@ ENV MLIR_SYS_220_PREFIX=/usr/lib/llvm-22 \
     LIBCLANG_PATH=/usr/lib/llvm-22/lib
 WORKDIR /src
 COPY . .
+# barvinok-sys pulls the barvinok C library, whose submodules (polylib, isl,
+# pet) are declared with `git://repo.or.cz/` URLs. The git:// protocol fails
+# in a clean container, so rewrite it to https and let cargo fetch through
+# the system git (which honours the rewrite) — otherwise the submodules stay
+# empty and barvinok's build dies on a missing polylib source.
+ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
+RUN git config --global url."https://repo.or.cz/".insteadOf "git://repo.or.cz/"
 # rust-toolchain at the repo root pins the nightly; rustup picks it up.
 RUN cargo build --release -p analyzer
 
@@ -81,8 +88,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgmp10 libmpfr6 libmpc3 libntl44 libzstd1 zlib1g \
     libfreetype6 libfontconfig1 ca-certificates \
     && rm -rf /var/lib/apt/lists/*
-# Polygeist runtime: cgeist/polygeist-opt link the shared LLVM 18 libraries.
-COPY --from=polygeist /usr/lib/llvm-18 /usr/lib/llvm-18
+# cgeist/polygeist-opt are statically linked against the self-built LLVM
+# (default LLVM build = static libs), so only the two binaries travel — no
+# LLVM runtime tree to copy.
 COPY --from=polygeist /opt/polygeist/bin/cgeist /opt/polygeist/bin/polygeist-opt /usr/local/bin/
 COPY --from=builder /src/target/release/analyzer /usr/local/bin/analyzer
 ENTRYPOINT ["/usr/local/bin/analyzer"]
