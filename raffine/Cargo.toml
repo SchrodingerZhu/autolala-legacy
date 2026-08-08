@@ -7,8 +7,8 @@ build = "build.rs"
 [dependencies]
 bumpalo = { version = "3.17.0", features = ["boxed", "collections"] }
 cxx = { version = "1.0.157", features = ["c++20"] }
-melior = { version = "0.24.0" }
-mlir-sys = "0.5.0"
+melior = { version = "0.27.4" }
+mlir-sys = "220.0.2"
 rustc-hash = { version = "2.1.1", features = ["rand"] }
 thiserror = "2.0.12"
 tracing = { version = "0.1.41", features = ["log"] }

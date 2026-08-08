@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install LLVM 22 (apt.llvm.org)
+        run: |
+          curl -fsSL https://apt.llvm.org/llvm.sh -o /tmp/llvm.sh
+          chmod +x /tmp/llvm.sh
+          sudo /tmp/llvm.sh 22
+          sudo apt-get install -y --no-install-recommends \
+            libmlir-22-dev mlir-22-tools libpolly-22-dev libclang-22-dev lld-22 lld
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build pkg-config \
+            autoconf automake libtool \
+            libgmp-dev libmpfr-dev libmpc-dev libntl-dev \
+            libzstd-dev zlib1g-dev libfreetype-dev libfontconfig-dev
+
+      - name: Install Rust (pinned nightly from rust-toolchain)
+        run: |
+          curl -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain none
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-llvm22-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-llvm22-
+
+      - name: Build
+        env:
+          MLIR_SYS_220_PREFIX: /usr/lib/llvm-22
+          TABLEGEN_220_PREFIX: /usr/lib/llvm-22
+          MLIR_SYS_210_PREFIX: /usr/lib/llvm-22
+          LLVM_SYS_220_PREFIX: /usr/lib/llvm-22
+          LLVM_SYS_221_PREFIX: /usr/lib/llvm-22
+          LIBCLANG_PATH: /usr/lib/llvm-22/lib
+        run: cargo build --release -p analyzer -p raffine -p denning
+
+      - name: Test
+        env:
+          MLIR_SYS_220_PREFIX: /usr/lib/llvm-22
+          TABLEGEN_220_PREFIX: /usr/lib/llvm-22
+          MLIR_SYS_210_PREFIX: /usr/lib/llvm-22
+          LLVM_SYS_220_PREFIX: /usr/lib/llvm-22
+          LLVM_SYS_221_PREFIX: /usr/lib/llvm-22
+          LIBCLANG_PATH: /usr/lib/llvm-22/lib
+        run: cargo test --release -p raffine -p analyzer
+
+  docker-cli:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build CLI image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: container/Dockerfile-cli
+          push: false
+          tags: autolala-cli:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

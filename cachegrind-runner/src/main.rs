@@ -1,8 +1,11 @@
 use anyhow::{Result, anyhow};
 use indicatif::ParallelProgressIterator;
 use melior::ir::attribute::{StringAttribute, TypeAttribute};
-use melior::ir::r#type::MemRefType;
-use melior::ir::{BlockLike, Module, OperationRef, RegionLike, ShapedTypeLike, ValueLike};
+use melior::ir::r#type::{DimSize, MemRefType};
+use melior::ir::{
+    BlockLike, Module, OperationRef, RegionLike, ShapedTypeLike, ValueLike,
+    operation::OperationLike,
+};
 use palc::Parser;
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
@@ -535,7 +538,10 @@ fn extract_global_arrays(module: &Module) -> anyhow::Result<Vec<GlobalArrayDecla
             let rank = memref_type.rank();
             let mut shape = Vec::with_capacity(rank);
             for dim in 0..rank {
-                shape.push(memref_type.dim_size(dim)?);
+                let DimSize::Static(size) = memref_type.dim_size(dim)? else {
+                    return Err(anyhow!("dynamic dimension size is not supported"));
+                };
+                shape.push(size as usize);
             }
             arrays.push(GlobalArrayDeclaration {
                 name: sym_name,
@@ -587,7 +593,10 @@ fn collect_allocs(func: OperationRef) -> anyhow::Result<Vec<GlobalArrayDeclarati
             let rank = memref_type.rank();
             let mut shape = Vec::with_capacity(rank);
             for dim in 0..rank {
-                shape.push(memref_type.dim_size(dim)?);
+                let DimSize::Static(size) = memref_type.dim_size(dim)? else {
+                    return Err(anyhow!("dynamic dimension size is not supported"));
+                };
+                shape.push(size as usize);
             }
             arrays.push(GlobalArrayDeclaration {
                 name: format!("ARRAY_{}", allocated),

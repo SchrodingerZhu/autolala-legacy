@@ -14,7 +14,10 @@ use raffine::{
 use serde::Serialize;
 use symbolica::{atom::Atom, domains::rational_polynomial::FromNumeratorAndDenominator};
 use symbolica::{atom::AtomCore, domains::integer::Integer};
-use symbolica::{domains::Ring, symbol};
+use symbolica::{
+    domains::{Ring, RingOps},
+    symbol,
+};
 use symbolica::{
     domains::{Field, integer::IntegerRing, rational_polynomial::RationalPolynomialField},
     printer::PrintOptions,
@@ -412,17 +415,16 @@ where
 
 pub fn get_ri_distro(dist: &[(Poly, Poly)]) -> anyhow::Result<Vec<(isize, f64)>> {
     let mut distro_map = AHashMap::new();
-    let empty_const_map = AHashMap::<Atom, _>::new();
-    let empty_symbol_map = AHashMap::new();
+    let empty_const_map = AHashMap::<Atom, f64>::new();
     for (value, portion) in dist.iter() {
         let value = value
             .to_expression()
-            .evaluate(|x| x.to_f64(), &empty_const_map, &empty_symbol_map)
+            .evaluate(&empty_const_map)
             .map_err(|e| anyhow::anyhow!("Failed to evaluate expression: {e}"))?
             as isize;
         let portion = portion
             .to_expression()
-            .evaluate(|x| x.to_f64(), &empty_const_map, &empty_symbol_map)
+            .evaluate(&empty_const_map)
             .map_err(|e| anyhow::anyhow!("Failed to evaluate expression: {e}"))?;
         match distro_map.entry(value) {
             std::collections::hash_map::Entry::Occupied(mut entry) => {
@@ -441,7 +443,7 @@ pub fn get_ri_distro(dist: &[(Poly, Poly)]) -> anyhow::Result<Vec<(isize, f64)>>
 pub fn subsitute_block_size(poly: &Poly, block_size: usize) -> Poly {
     let vars = poly.get_variables();
     let var_idx = vars.iter().position(|v| {
-        v.to_id()
+        v.get_id()
             .map(|id| id.get_stripped_name() == "b")
             .unwrap_or(false)
     });

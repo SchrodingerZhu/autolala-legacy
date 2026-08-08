@@ -3,7 +3,7 @@ use std::error::Error;
 use std::path::Path;
 use std::process::Command;
 
-const LLVM_MAJOR_VERSION: usize = 20;
+const LLVM_MAJOR_VERSION: usize = 22;
 
 fn llvm_config(argument: &str) -> Result<String, Box<dyn Error>> {
     let prefix = env::var(format!("MLIR_SYS_{LLVM_MAJOR_VERSION}0_PREFIX"))

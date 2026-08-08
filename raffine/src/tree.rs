@@ -4,6 +4,7 @@ use std::{
     fmt::Write,
 };
 
+use melior::ir::operation::OperationLike;
 use melior::ir::{BlockLike, BlockRef, OperationRef, RegionLike, Value, ValueLike};
 use rustc_hash::FxHashMapRand;
 pub use ustr::Ustr;
@@ -448,6 +449,7 @@ impl Context {
 
 #[cfg(test)]
 mod tests {
+    use melior::ir::operation::OperationLike;
     use melior::ir::{BlockLike, Module, RegionLike};
 
     use crate::Context;

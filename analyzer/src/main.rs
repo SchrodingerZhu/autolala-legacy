@@ -3,7 +3,7 @@ use barvinok::ContextRef as BContext;
 use barvinok::constraint::Constraint;
 use barvinok::local_space::LocalSpace;
 use melior::Context as MContext;
-use melior::ir::{BlockLike, Module, OperationRef, RegionLike};
+use melior::ir::{BlockLike, Module, OperationRef, RegionLike, operation::OperationLike};
 use palc::{Parser, Subcommand};
 use plotters::prelude::IntoDrawingArea;
 use raffine::Context as RContext;
@@ -268,29 +268,29 @@ fn main_entry() -> anyhow::Result<()> {
             for (idx, bound) in symbol_lowerbound.iter().enumerate() {
                 let bound = *bound;
                 debug!("Setting lower bound for symbol {idx} >= {bound}");
-                let constraint = Constraint::new_inequality(local_space.clone())
-                    .set_coefficient_si(barvinok::DimType::Param, idx as u32, 1)?
+                let constraint = Constraint::new_inequality(local_space.clone())?
+                    .set_coefficient_si(barvinok::DimType::Param, idx as i32, 1)?
                     .set_constant_si(-bound)?;
                 space = space.add_constraint(constraint)?;
             }
             if *infinite_repeat {
-                let num_params = space.get_dims(barvinok::DimType::Param)?;
+                let num_params = space.dim(barvinok::DimType::Param)?;
                 space = space
                     .insert_dims(barvinok::DimType::Out, 0, 1)?
                     .insert_dims(barvinok::DimType::Param, num_params, 1)?
                     .set_dim_name(barvinok::DimType::Param, num_params, "R")?;
                 let local_space: LocalSpace = space.get_space()?.try_into()?;
-                let lb = Constraint::new_inequality(local_space.clone()).set_coefficient_si(
+                let lb = Constraint::new_inequality(local_space.clone())?.set_coefficient_si(
                     barvinok::DimType::Out,
                     0,
                     1,
                 )?;
-                let ub = Constraint::new_inequality(local_space.clone())
+                let ub = Constraint::new_inequality(local_space.clone())?
                     .set_coefficient_si(barvinok::DimType::Out, 0, -1)?
-                    .set_coefficient_si(barvinok::DimType::Param, num_params, 1)?
+                    .set_coefficient_si(barvinok::DimType::Param, num_params as i32, 1)?
                     .set_constant_si(-1)?;
-                let repeat_lb = Constraint::new_inequality(local_space.clone())
-                    .set_coefficient_si(barvinok::DimType::Param, num_params, 1)?
+                let repeat_lb = Constraint::new_inequality(local_space.clone())?
+                    .set_coefficient_si(barvinok::DimType::Param, num_params as i32, 1)?
                     .set_constant_si(-2)?;
                 space = space
                     .add_constraint(lb)?
@@ -307,7 +307,7 @@ fn main_entry() -> anyhow::Result<()> {
                 *num_sets,
             )?;
             if *infinite_repeat {
-                let num_params = access_map.get_space()?.get_dim(barvinok::DimType::Param)?;
+                let num_params = access_map.get_space()?.dim(barvinok::DimType::Param)?;
                 access_map = access_map
                     .insert_dims(barvinok::DimType::In, 0, 1)?
                     .insert_dims(barvinok::DimType::Param, num_params, 1)?
