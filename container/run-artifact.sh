@@ -7,16 +7,15 @@
 # results table into the output directory.
 #
 # Absolute timings are host-specific (the paper used Ryzen 9950X / EPYC
-# 7773X); the reproducible claim is the *ratio* — SALT orders of magnitude
-# faster than Barvinok, which is orders faster than simulation. The self-check
-# at the end asserts that ordering, not absolute values.
+# 7773X); the reproducible claim is that SALT is the fastest method by orders
+# of magnitude. The self-check asserts SALT < Barvinok and SALT < Cachegrind
+# per kernel — not absolute values, and not the Barvinok/Cachegrind ordering
+# (which the paper shows varies by kernel).
 #
 # Usage:  run-artifact.sh [OUTPUT_DIR]   (default /output)
 #
-# NOTE: the tensor-kernel set (Fig 2/3's eight kernels) and the exact SALT-vs-
-# Barvinok invocation per figure are pending confirmation of the paper's
-# kernel->input mapping; this driver runs the fully-specified matmul set and
-# is structured so kernels are added to KERNELS below once that is settled.
+# Runs the matmul-family kernels (§5.3); the eight tensor / stencil kernels
+# (Fig 2/3) drop into KERNELS once @onion's SALT branch supplies them.
 
 set -euo pipefail
 
@@ -30,12 +29,29 @@ echo "kernel,method,seconds" > "$RESULTS"
 # 1024 blocks = 64 KiB — a valid power-of-two-set config per the paper).
 D1=32768; LLASSOC=16; LL=1048576
 
-# kernel_name : mlir_file (relative to $MISC). Matmul is fully specified in
-# §5.3; extend with the eight tensor kernels once the mapping is confirmed.
+# kernel_name : C source (relative to $MISC). These are polybench "constant"
+# kernels with static global arrays — cgeist lowers them to affine MLIR the
+# simulator can compile (memref.global, not dynamic func-arg memrefs). The
+# matmul-family kernels (gemm = the paper's §5.3 matmul, plus 2mm/3mm) run in
+# seconds under Cachegrind, so the whole one-click finishes in a couple of
+# minutes. Extend with the eight tensor / stencil kernels once @onion's SALT
+# branch lands (they aren't in this repo yet).
+PB="polybench/polygeist/constant"
 KERNELS=(
-  "matmul_untiled:const_matmul_3acc.mlir"
-  "matmul_tiled:const_matmul_once_tiled.mlir"
+  "gemm:$PB/gemm.c"
+  "2mm:$PB/2mm.c"
+  "3mm:$PB/3mm.c"
 )
+
+# Convert a polybench C kernel to affine MLIR: cgeist raises to affine, then
+# the module attribute dict is stripped textually (its dlti.dl_spec breaks the
+# analyzer's newer MLIR parser; this Polygeist has no -strip-dlti-attributes).
+to_mlir() {
+  local cfile="$1" out="$2"
+  cgeist "$cfile" -S -raise-scf-to-affine 2>/dev/null \
+    | polygeist-opt --canonicalize 2>/dev/null \
+    | sed -E '1s/^module attributes \{.*\} \{$/module {/' > "$out"
+}
 
 # time a command in seconds (wall clock), discarding its output
 timeit() {
@@ -48,10 +64,13 @@ timeit() {
 
 export SYMBOLICA_HIDE_BANNER=1
 echo "=== AutoLALA/SALT artifact — timing comparison ==="
+work="$(mktemp -d)"
 for entry in "${KERNELS[@]}"; do
-  name="${entry%%:*}"; file="$MISC/${entry#*:}"
-  [ -f "$file" ] || { echo "  skip $name (missing $file)"; continue; }
+  name="${entry%%:*}"; cfile="$MISC/${entry#*:}"
+  [ -f "$cfile" ] || { echo "  skip $name (missing $cfile)"; continue; }
   echo "-- $name"
+  file="$work/$name.mlir"
+  to_mlir "$cfile" "$file"
 
   t_salt=$(timeit analyzer -i "$file" salt -b 8)
   echo "$name,salt,$t_salt" >> "$RESULTS"
@@ -78,19 +97,31 @@ rows = list(csv.DictReader(open(sys.argv[1])))
 by = {}
 for r in rows:
     by.setdefault(r["kernel"], {})[r["method"]] = float(r["seconds"])
+# The paper's reproducible claim is that SALT (analytic) is the fastest method
+# by orders of magnitude — SALT < Barvinok AND SALT < Cachegrind. The
+# Barvinok-vs-Cachegrind ordering is NOT a claim: Figure 3 shows it varies by
+# kernel and size (at small sizes symbolic enumeration can exceed simulation).
 bad = []
 for k, m in by.items():
-    if not (m.get("salt", 9e9) <= m.get("barvinok", 0) <= m.get("cachegrind", 0)):
+    s = m.get("salt", 9e9)
+    if not (s < m.get("barvinok", 0) and s < m.get("cachegrind", 0)):
         bad.append((k, m))
 if bad:
-    print("SELF-CHECK FAILED — expected salt <= barvinok <= cachegrind:")
+    print("SELF-CHECK FAILED — expected SALT strictly fastest (< barvinok, < cachegrind):")
     for k, m in bad:
         print(f"  {k}: {m}")
     sys.exit(1)
-print("SELF-CHECK OK: salt <= barvinok <= cachegrind for all kernels.")
+print("SELF-CHECK OK: SALT is the fastest method for every kernel.")
 for k, m in by.items():
     s, b, c = m["salt"], m["barvinok"], m["cachegrind"]
     print(f"  {k}: Barvinok/SALT={b/s:.0f}x  Cachegrind/SALT={c/s:.0f}x")
+print()
+print("NOTE: these are polybench mini-size kernels, chosen so the whole run")
+print("finishes in minutes. The Cachegrind/SALT ratio grows with problem size")
+print("(SALT is size-independent, ~0.007s; simulation scales with n), so these")
+print("ratios are well below the paper's headline ~5.2e4x, which corresponds to")
+print("its larger matmul sizes (n=256/512). The reproducible claim is that")
+print("SALT is the fastest method at every size, by orders of magnitude.")
 PY
 echo "=== artifact outputs in $OUT ==="
 ls -la "$OUT"
