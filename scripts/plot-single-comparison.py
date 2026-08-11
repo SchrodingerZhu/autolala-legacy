@@ -5,6 +5,7 @@ import json
 import matplotlib.pyplot as plt
 import numpy as np
 import argparse
+import shutil
 import subprocess
 import os
 import sys
@@ -148,12 +149,15 @@ def convert_c_to_mlir(c_file, output_mlir):
     cgeist_path = os.path.join(POLYGEIST_PATH, "cgeist") if POLYGEIST_PATH else "cgeist"
     polygeist_opt_path = os.path.join(POLYGEIST_PATH, "polygeist-opt") if POLYGEIST_PATH else "polygeist-opt"
     
-    # Check if polygeist binaries exist
-    if not os.path.exists(cgeist_path):
-        print(f"{Colors.RED}❌ Error: cgeist not found at {cgeist_path}{Colors.RESET}")
+    # Check the polygeist binaries exist (as a file path, or resolvable on PATH
+    # when POLYGEIST_PATH is unset and we're using bare names).
+    def _resolvable(p):
+        return os.path.exists(p) or shutil.which(p) is not None
+    if not _resolvable(cgeist_path):
+        print(f"{Colors.RED}❌ Error: cgeist not found ({cgeist_path}){Colors.RESET}")
         sys.exit(1)
-    if not os.path.exists(polygeist_opt_path):
-        print(f"{Colors.RED}❌ Error: polygeist-opt not found at {polygeist_opt_path}{Colors.RESET}")
+    if not _resolvable(polygeist_opt_path):
+        print(f"{Colors.RED}❌ Error: polygeist-opt not found ({polygeist_opt_path}){Colors.RESET}")
         sys.exit(1)
     
     print(f"{Colors.CYAN}🔄 Converting C file to MLIR: {os.path.basename(c_file)} -> {os.path.basename(output_mlir)}{Colors.RESET}")
