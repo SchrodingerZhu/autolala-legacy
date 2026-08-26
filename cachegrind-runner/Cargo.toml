@@ -9,7 +9,7 @@ palc = { git = "https://github.com/oxalica/palc.git" }
 anyhow = { version = "1.0.98", features = ["backtrace"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
-melior = { version = "0.24.0"}
+melior = { version = "0.27.4"}
 tempfile = "3.20.0"
 unescaper = "0.1.6"
 rusqlite = { version = "0.37.0", features = ["bundled-full"] }

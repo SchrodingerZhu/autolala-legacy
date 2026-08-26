@@ -1,0 +1,126 @@
+# CLI-only image: the `analyzer` binary plus Polygeist's `cgeist` for direct
+# C input.
+#
+# Two LLVM toolchains:
+#   - The analyzer builds on ubuntu 24.04 + apt.llvm.org LLVM 22 (mlir-sys
+#     220 / melior 0.27).
+#   - Polygeist pins an *unreleased* llvm-project commit whose MLIR C++ API
+#     matches no released LLVM (18.1.8 and 19 both fail to compile it), so
+#     its stage self-compiles that pinned LLVM/MLIR/Clang. cgeist and
+#     polygeist-opt link statically and travel as two binaries into the
+#     final 24.04 image.
+
+# ---------------------------------------------------------------- polygeist
+FROM ubuntu:24.04 AS polygeist
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl gnupg git cmake ninja-build build-essential \
+    python3 zlib1g-dev libzstd-dev lld clang
+# Polygeist pins an *unreleased* llvm-project commit whose MLIR C++ API
+# sits between released LLVM versions — released 18.1.8 and 19 both fail to
+# compile it (opaque-pointer and rewriter-API drift in opposite directions).
+# So this stage self-compiles Polygeist's own pinned LLVM/MLIR/Clang via the
+# standard unified in-tree build. Nothing from apt.llvm.org here.
+RUN git clone --depth 1 https://github.com/llvm/Polygeist /opt/polygeist-src \
+    && git -C /opt/polygeist-src submodule update --init --depth 1 llvm-project
+# Build LLVM+MLIR+Clang and Polygeist together (the project's documented
+# recipe). Host target only, Release, assertions off, no tests/examples —
+# the minimum that yields a working cgeist/polygeist-opt.
+RUN cmake -S /opt/polygeist-src/llvm-project/llvm -B /opt/polygeist-build -G Ninja \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_C_COMPILER=clang \
+      -DCMAKE_CXX_COMPILER=clang++ \
+      -DLLVM_USE_LINKER=lld \
+      -DLLVM_ENABLE_PROJECTS="clang;mlir" \
+      -DLLVM_EXTERNAL_PROJECTS=polygeist \
+      -DLLVM_EXTERNAL_POLYGEIST_SOURCE_DIR=/opt/polygeist-src \
+      -DLLVM_TARGETS_TO_BUILD="host" \
+      -DLLVM_ENABLE_ASSERTIONS=OFF \
+      -DLLVM_INCLUDE_TESTS=OFF \
+      -DLLVM_INCLUDE_EXAMPLES=OFF \
+    && cmake --build /opt/polygeist-build --target cgeist polygeist-opt \
+    && mkdir -p /opt/polygeist/bin \
+    && cp /opt/polygeist-build/bin/cgeist /opt/polygeist-build/bin/polygeist-opt \
+         /opt/polygeist/bin/
+
+# ---------------------------------------------------------------- builder
+FROM ubuntu:24.04 AS builder
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl gnupg lsb-release software-properties-common \
+    git build-essential cmake ninja-build pkg-config \
+    autoconf automake libtool \
+    libgmp-dev libmpfr-dev libmpc-dev libntl-dev \
+    libzstd-dev zlib1g-dev \
+    libfreetype-dev libfontconfig-dev \
+    python3
+RUN curl -fsSL https://apt.llvm.org/llvm.sh -o /tmp/llvm.sh \
+    && chmod +x /tmp/llvm.sh \
+    && /tmp/llvm.sh 22 \
+    && apt-get install -y --no-install-recommends \
+       libmlir-22-dev mlir-22-tools libpolly-22-dev libclang-22-dev lld-22 lld
+RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain none
+ENV PATH=/root/.cargo/bin:$PATH
+# mlir-sys/tblgen (220), melior-macro still reads the LLVM-21-era variable
+# while targeting 22, and llvm-sys consumers use 220/221 — set all of them.
+ENV MLIR_SYS_220_PREFIX=/usr/lib/llvm-22 \
+    TABLEGEN_220_PREFIX=/usr/lib/llvm-22 \
+    MLIR_SYS_210_PREFIX=/usr/lib/llvm-22 \
+    LLVM_SYS_220_PREFIX=/usr/lib/llvm-22 \
+    LLVM_SYS_221_PREFIX=/usr/lib/llvm-22 \
+    LIBCLANG_PATH=/usr/lib/llvm-22/lib
+WORKDIR /src
+COPY . .
+# barvinok-sys pulls the barvinok C library, whose submodules (polylib, isl,
+# pet) are declared with `git://repo.or.cz/` URLs. The git:// protocol fails
+# in a clean container, so rewrite it to https and let cargo fetch through
+# the system git (which honours the rewrite) — otherwise the submodules stay
+# empty and barvinok's build dies on a missing polylib source.
+ENV CARGO_NET_GIT_FETCH_WITH_CLI=true CARGO_NET_RETRY=5
+RUN git config --global url."https://repo.or.cz/".insteadOf "git://repo.or.cz/"
+# barvinok's submodules live on repo.or.cz, which TLS-flakes intermittently.
+# A reviewer builds this image once and won't retry, so absorb the flake:
+# fetch all crates + git submodules up front with retries, then build
+# offline. (Vendoring the sources would remove the host entirely; left as a
+# follow-up so the base branch doesn't carry a large vendored tree.)
+RUN for i in 1 2 3 4 5; do \
+      cargo fetch && break || { echo "cargo fetch attempt $i failed; retrying"; sleep 5; }; \
+    done
+# rust-toolchain at the repo root pins the nightly; rustup picks it up.
+# analyzer = prediction; cachegrind-runner = simulation ground truth;
+# assoc-conv = N-way associativity conversion of prediction output.
+RUN cargo build --release --offline -p analyzer -p cachegrind-runner -p assoc-conv
+
+# ---------------------------------------------------------------- runtime
+FROM ubuntu:24.04
+ENV DEBIAN_FRONTEND=noninteractive
+# Runtime libs for the Rust tools, plus the simulation and plotting stack:
+#   valgrind (cachegrind) + clang — cachegrind-runner compiles and runs each
+#   kernel for ground-truth miss counts; python3 + the scientific stack —
+#   the plot scripts (matplotlib/numpy/pandas/scipy/seaborn/islpy/sqlite).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgmp10 libmpfr6 libmpc3 libntl44 libzstd1 zlib1g \
+    libfreetype6 libfontconfig1 ca-certificates \
+    valgrind clang \
+    python3 python3-pip python3-venv sqlite3 \
+    bash coreutils \
+    && rm -rf /var/lib/apt/lists/*
+# Plot dependencies in a venv (ubuntu 24.04 is PEP 668 externally-managed).
+RUN python3 -m venv /opt/venv \
+    && /opt/venv/bin/pip install --no-cache-dir \
+       matplotlib numpy pandas scipy seaborn tabulate tqdm islpy
+ENV PATH=/opt/venv/bin:/usr/local/bin:$PATH
+# cgeist/polygeist-opt are statically linked against the self-built LLVM
+# (default LLVM build = static libs), so only the two binaries travel — no
+# LLVM runtime tree to copy.
+COPY --from=polygeist /opt/polygeist/bin/cgeist /opt/polygeist/bin/polygeist-opt /usr/local/bin/
+COPY --from=builder /src/target/release/analyzer \
+     /src/target/release/cachegrind-runner \
+     /src/target/release/assoc-conv /usr/local/bin/
+# Benchmark harness: scripts, plot code, and the input corpus.
+COPY --from=builder /src/scripts /opt/autolala/scripts
+COPY --from=builder /src/analyzer/misc /opt/autolala/misc
+WORKDIR /opt/autolala
+# Default to the analyzer CLI; the one-click benchmark driver is invoked
+# explicitly (entrypoint overridden) until the SALT flow is wired in.
+ENTRYPOINT ["/usr/local/bin/analyzer"]

@@ -6,7 +6,7 @@ use raffine::tree::ValID;
 use symbolica::atom::Atom;
 use symbolica::atom::AtomCore;
 use symbolica::domains::Field;
-use symbolica::domains::Ring;
+use symbolica::domains::RingOps;
 use symbolica::domains::integer::IntegerRing;
 use symbolica::domains::rational_polynomial::RationalPolynomial;
 use symbolica::domains::rational_polynomial::RationalPolynomialField;
