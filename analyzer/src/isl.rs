@@ -1063,17 +1063,50 @@ impl<'a> QpolyConverter<'a> {
     }
 }
 
+/// Picks a name of the form `<prefix><n>` that no dimension already uses.
+///
+/// Auto-naming by position is not safe on its own: `get_timestamp_space_impl`
+/// names a loop dimension after its *depth*, not its index, so `i3` can already
+/// belong to some other dimension by the time an unnamed one at index 3 needs a
+/// name. Two dimensions sharing a name is silently destructive rather than an
+/// error -- `evaluate_poly` builds a name-keyed map of dimension values, so the
+/// later duplicate overwrites the earlier one and every distribution value that
+/// mentions that name is then evaluated at the wrong coordinate.
+fn fresh_dim_name(taken: &mut std::collections::HashSet<String>, prefix: &str, start: u32) -> String {
+    let mut index = start;
+    loop {
+        let candidate = format!("{prefix}{index}");
+        if taken.insert(candidate.clone()) {
+            return candidate;
+        }
+        index += 1;
+    }
+}
+
 pub(crate) fn ensure_set_name<'a>(mut set: Set<'a>) -> Result<Set<'a>> {
     let params = set.n_param()?;
     let dims = set.n_dim()?;
+    let mut taken = std::collections::HashSet::new();
+    for i in 0..params {
+        if let Some(name) = set.get_dim_name(DimType::Param, i)? {
+            taken.insert(name.to_string());
+        }
+    }
+    for i in 0..dims {
+        if let Some(name) = set.get_dim_name(DimType::Out, i)? {
+            taken.insert(name.to_string());
+        }
+    }
     for i in 0..params {
         if !set.has_dim_name(DimType::Param, i)? {
-            set = set.set_dim_name(DimType::Param, i, &format!("p{i}"))?;
+            let name = fresh_dim_name(&mut taken, "p", i);
+            set = set.set_dim_name(DimType::Param, i, &name)?;
         }
     }
     for i in 0..dims {
         if !set.has_dim_name(DimType::Out, i)? {
-            set = set.set_dim_name(DimType::Out, i, &format!("i{i}"))?;
+            let name = fresh_dim_name(&mut taken, "i", i);
+            set = set.set_dim_name(DimType::Out, i, &name)?;
         }
     }
     Ok(set)
@@ -1082,14 +1115,27 @@ pub(crate) fn ensure_set_name<'a>(mut set: Set<'a>) -> Result<Set<'a>> {
 pub(crate) fn ensure_map_domain_name<'a>(mut map: Map<'a>) -> Result<Map<'a>> {
     let params = map.dim(DimType::Param)?;
     let in_dims = map.dim(DimType::In)?;
+    let mut taken = std::collections::HashSet::new();
+    for i in 0..params {
+        if let Some(name) = map.get_dim_name(DimType::Param, i)? {
+            taken.insert(name.to_string());
+        }
+    }
+    for i in 0..in_dims {
+        if let Some(name) = map.get_dim_name(DimType::In, i)? {
+            taken.insert(name.to_string());
+        }
+    }
     for i in 0..params {
         if !map.has_dim_name(DimType::Param, i)? {
-            map = map.set_dim_name(DimType::Param, i, &format!("p{i}"))?;
+            let name = fresh_dim_name(&mut taken, "p", i);
+            map = map.set_dim_name(DimType::Param, i, &name)?;
         }
     }
     for i in 0..in_dims {
         if !map.has_dim_name(DimType::In, i)? {
-            map = map.set_dim_name(DimType::In, i, &format!("i{i}"))?;
+            let name = fresh_dim_name(&mut taken, "i", i);
+            map = map.set_dim_name(DimType::In, i, &name)?;
         }
     }
     Ok(map)
@@ -1187,7 +1233,18 @@ fn evaluate_poly<'a>(poly: &Poly, point: &Point<'a>) -> Result<f64> {
             continue;
         };
         let val = point.get_coordinate_val(DimType::Out, i as i32)?.to_f64();
-        const_map.insert(atom, val);
+        // Two dimensions sharing a name would make this silently evaluate the
+        // expression at the wrong coordinate, which shows up much later as
+        // distribution mass landing on the wrong reuse interval. Fail loudly
+        // instead; `ensure_set_name` is responsible for keeping names unique.
+        if let Some(previous) = const_map.insert(atom, val)
+            && previous != val
+        {
+            return Err(anyhow::anyhow!(
+                "dimension name `{name}` is used by more than one dimension, with values \
+                 {previous} and {val}; distribution values referring to it cannot be evaluated"
+            ));
+        }
     }
     expr.evaluate(&const_map)
         .map_err(|msg| anyhow::anyhow!("failed to evaluate polynomial: {msg}"))

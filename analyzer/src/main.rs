@@ -12,6 +12,7 @@ use std::num::NonZero;
 use std::{collections::HashMap, io::Read, path::PathBuf};
 use tracing::{debug, error, info};
 mod isl;
+mod parallel;
 mod polygeist;
 mod salt;
 mod utils;
@@ -81,6 +82,28 @@ enum Method {
         #[arg(long)]
         /// path to save the raw distribution bincode
         save_distro: Option<PathBuf>,
+        /// Nesting level of the loop to model as `omp parallel for`
+        /// (outermost is 0). Without this the analysis is sequential.
+        #[arg(short = 'P', long)]
+        parallel_loop_depth: Option<usize>,
+        /// Thread count for the parallel model.
+        #[arg(short = 'T', long, default_value = "1")]
+        threads: NonZero<u32>,
+        /// `schedule(static, chunk)` chunk size. Defaults to
+        /// `ceil(trip / threads)`, OpenMP's own `schedule(static)`, when the
+        /// parallel loop's bounds are compile-time constants.
+        #[arg(short = 'C', long)]
+        chunk: Option<NonZero<i64>>,
+        /// Equal-probability buckets used to discretize the racetrack law.
+        #[arg(long, default_value = "512")]
+        racetrack_bins: NonZero<usize>,
+        /// Tail mass below which a negative-binomial expansion stops.
+        #[arg(long, default_value = "1e-12")]
+        nbd_epsilon: f64,
+        /// Reuse intervals at or below this use the negative binomial; longer
+        /// ones use the concentrated law. Defaults to Theorem 3.1's bound.
+        #[arg(long)]
+        short_ri_bound: Option<f64>,
     },
     /// Use the PerfectTiling algorithm to compute the polyhedral model
     Salt {
@@ -296,6 +319,12 @@ fn main_entry() -> anyhow::Result<()> {
             num_sets,
             max_operations,
             save_distro,
+            parallel_loop_depth,
+            threads,
+            chunk,
+            racetrack_bins,
+            nbd_epsilon,
+            short_ri_bound,
         } => AnalysisContext::start_with_args(barvinok_arg.as_slice(), |context| {
             let context = &context;
             context.bcontext().set_max_operations(*max_operations);
@@ -343,6 +372,51 @@ fn main_entry() -> anyhow::Result<()> {
                 space = space.add_constraint(lb)?.add_constraint(ub)?;
                 debug!("space with infinite repeat: {space:?}");
             }
+            // Model one loop as `omp parallel for` by materializing the
+            // owning thread as timestamp dimension 0. Done here, before
+            // `ensure_set_name`, so it follows the same insert-then-name order
+            // the run-twice path above uses.
+            let parallel_spec = match parallel_loop_depth {
+                None => None,
+                Some(loop_level) => {
+                    if *infinite_repeat {
+                        return Err(anyhow!(
+                            "--parallel-loop-depth and --infinite-repeat both prepend a timestamp \
+                             dimension and have not been validated together"
+                        ));
+                    }
+                    let threads = threads.get();
+                    let chunk = match chunk {
+                        Some(chunk) => chunk.get(),
+                        None => {
+                            let trip = parallel::constant_trip_count(tree, *loop_level)
+                                .ok_or_else(|| anyhow!(
+                                    "the loop at nesting level {loop_level} has symbolic bounds, \
+                                     so the default chunk `ceil(trip / threads)` cannot be \
+                                     resolved; pass --chunk explicitly"
+                                ))?;
+                            (trip + i64::from(threads) - 1)
+                                .div_euclid(i64::from(threads))
+                                .max(1)
+                        }
+                    };
+                    let spec = parallel::ParallelSpec {
+                        loop_level: *loop_level,
+                        threads,
+                        chunk,
+                    };
+                    let ts_dim = parallel::timestamp_dim_of_loop(tree, spec.loop_level)?;
+                    info!(
+                        "modeling loop level {} (timestamp dim {ts_dim}) as parallel over {} \
+                         thread(s), schedule(static, {})",
+                        spec.loop_level, spec.threads, spec.chunk
+                    );
+                    let (extended, thread_dim) =
+                        parallel::add_thread_dim(space, ts_dim, &spec)?;
+                    space = extended;
+                    Some((spec, thread_dim))
+                }
+            };
             space = isl::ensure_set_name(space)?;
             let mut access_map = isl::get_access_map(
                 (max_param + 1).try_into()?,
@@ -356,8 +430,87 @@ fn main_entry() -> anyhow::Result<()> {
                 // with the timestamp space below bounds it to [0, 2).
                 access_map = access_map.insert_dims(barvinok::DimType::In, 0, 1)?;
             }
+            if parallel_spec.is_some() {
+                // Same story for the thread dim: unconstrained here, pinned by
+                // the intersection with the timestamp space below. Appended
+                // last, matching where `add_thread_dim` put it.
+                let in_dims = access_map.get_space()?.dim(barvinok::DimType::In)?;
+                access_map = access_map
+                    .insert_dims(barvinok::DimType::In, in_dims, 1)?
+                    .set_dim_name(
+                        barvinok::DimType::In,
+                        in_dims,
+                        parallel::THREAD_DIM_NAME,
+                    )?;
+            }
             let access_map = isl::ensure_map_domain_name(access_map)?;
             let access_map = access_map.intersect_domain(space.clone())?;
+
+            if let Some((spec, thread_dim)) = &parallel_spec {
+                let short_bound = match short_ri_bound {
+                    Some(bound) => *bound,
+                    None => parallel::ShortBound::default().value()?,
+                };
+                let knobs = parallel::CriKnobs {
+                    short_bound,
+                    racetrack_bins: racetrack_bins.get(),
+                    nbd_epsilon: *nbd_epsilon,
+                };
+                let report = parallel::analyze(
+                    space.clone(),
+                    access_map.clone(),
+                    *thread_dim,
+                    spec,
+                    &knobs,
+                )?;
+                let mut curve = denning::MissRatioCurve::new(&report.support);
+                if options.associativity.get() > 1 {
+                    curve = curve.compute_assoc(
+                        options.associativity.get(),
+                        1.0,
+                        denning::SkewDecay::Constant,
+                    );
+                }
+                if options.json {
+                    let output = serde_json::json!({
+                        "parallel": &report,
+                        "miss_ratio_curve": &curve,
+                        "elapsed_seconds": start_time.elapsed().as_secs_f64(),
+                    });
+                    writeln!(writer, "{output}")?;
+                } else {
+                    writeln!(
+                        writer,
+                        "parallel model: {} thread(s), schedule(static, {}), short-RI bound {:.1}",
+                        report.threads, report.chunk, report.short_ri_bound
+                    )?;
+                    writeln!(
+                        writer,
+                        "access mass: {:.4} private reuse, {:.4} shared reuse, {:.4} compulsory",
+                        report.private_portion, report.shared_portion, report.cold_portion
+                    )?;
+                    writeln!(
+                        writer,
+                        "mean sharing degree: {:.2} of {} thread(s)",
+                        report.mean_sharing_degree, report.threads
+                    )?;
+                    writeln!(writer, "CRI support points: {}", report.support.len())?;
+                }
+                if let Some(path) = &options.miss_ratio_curve {
+                    let svgbackend = plotters::backend::SVGBackend::new(
+                        path,
+                        (
+                            options.miss_ratio_curve_width,
+                            options.miss_ratio_curve_height,
+                        ),
+                    );
+                    let area = svgbackend.into_drawing_area();
+                    curve.plot_miss_ratio_curve(&area)?;
+                    info!("Miss ratio curve saved to {}", path.display());
+                }
+                return Ok(());
+            }
+
             let gt = space.clone().lex_gt_set(space.clone())?;
             let lt = gt.clone().reverse()?;
             let ge = space.clone().lex_ge_set(space.clone())?;

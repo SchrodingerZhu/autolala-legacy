@@ -1,0 +1,22 @@
+[package]
+name = "parallel-sampler"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "psample"
+path = "src/main.rs"
+
+[dependencies]
+raffine = { path = "../raffine" }
+denning = { path = "../denning" }
+melior = { version = "0.27.4" }
+palc = { git = "https://github.com/oxalica/palc" }
+anyhow = { version = "1.0.98", features = ["backtrace"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+rustc-hash = "2.1.1"
+rand = "0.9.2"
+rand_chacha = "0.9.0"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"

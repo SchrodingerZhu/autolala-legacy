@@ -3313,6 +3313,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "parallel-sampler"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "denning",
+ "melior",
+ "palc",
+ "raffine",
+ "rand 0.9.2",
+ "rand_chacha 0.9.0",
+ "rustc-hash",
+ "serde",
+ "serde_json",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "parking"
 version = "2.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

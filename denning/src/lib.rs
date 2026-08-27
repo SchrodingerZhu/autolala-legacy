@@ -212,6 +212,38 @@ impl MissRatioCurve {
         }
     }
 
+    /// Miss ratio at each turning point, in the same order as
+    /// [`Self::turning_points`].
+    pub fn miss_ratio(&self) -> &[f64] {
+        &self.miss_ratio
+    }
+
+    /// Cache sizes at which the miss ratio steps down.
+    pub fn turning_points(&self) -> &[f64] {
+        &self.turning_points
+    }
+
+    /// Miss ratio for a fully-associative LRU cache of `cache_size` blocks.
+    ///
+    /// The curve is a step function, so this is the miss ratio attached to the
+    /// last turning point at or below `cache_size`. Sizes below the first
+    /// turning point miss everything; an empty curve reports a miss ratio of 1
+    /// rather than dividing into nothing.
+    pub fn miss_ratio_at(&self, cache_size: f64) -> f64 {
+        if self.turning_points.is_empty() {
+            return 1.0;
+        }
+        // Turning points are non-decreasing, so a binary search finds the step
+        // containing `cache_size` without scanning a long curve per query.
+        let index = self
+            .turning_points
+            .partition_point(|point| *point <= cache_size);
+        match index.checked_sub(1) {
+            Some(index) => self.miss_ratio[index],
+            None => 1.0,
+        }
+    }
+
     #[cfg(feature = "plotters")]
     pub fn plot_miss_ratio_curve<DB: DrawingBackend>(
         &self,
@@ -302,5 +334,68 @@ impl MissRatioCurve {
                     .step(Step::End) // horizontal → drop at the *end* of an interval
                     .show_symbol(false),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// "0 1 2 2 1 0" has reuse intervals 1, 3 and 5, one access each out of
+    /// six, and three compulsory misses.
+    fn example() -> MissRatioCurve {
+        MissRatioCurve::new(&[(0, 0.0), (1, 1.0 / 6.0), (3, 1.0 / 6.0), (5, 1.0 / 6.0)])
+    }
+
+    #[test]
+    fn miss_ratio_is_non_increasing_in_cache_size() {
+        let curve = example();
+        let mut previous = f64::INFINITY;
+        for size in 0..40 {
+            let observed = curve.miss_ratio_at(f64::from(size));
+            assert!(
+                observed <= previous + 1e-12,
+                "miss ratio rose from {previous} to {observed} at cache size {size}"
+            );
+            previous = observed;
+        }
+    }
+
+    #[test]
+    fn a_cache_below_the_first_turning_point_misses_everything() {
+        assert_eq!(example().miss_ratio_at(-1.0), 1.0);
+    }
+
+    #[test]
+    fn an_empty_curve_reports_total_misses() {
+        assert_eq!(MissRatioCurve::new(&[]).miss_ratio_at(1024.0), 1.0);
+    }
+
+    #[test]
+    fn a_large_cache_leaves_only_the_compulsory_misses() {
+        let curve = example();
+        let largest = curve.turning_points().last().copied().unwrap_or_default();
+        // Three of six accesses are compulsory misses.
+        assert!(
+            (curve.miss_ratio_at(largest + 1000.0) - 0.5).abs() < 1e-9,
+            "got {}",
+            curve.miss_ratio_at(largest + 1000.0)
+        );
+    }
+
+    #[test]
+    fn lookup_agrees_with_a_linear_scan() {
+        let curve = example();
+        for size in 0..40 {
+            let size = f64::from(size);
+            let expected = curve
+                .turning_points()
+                .iter()
+                .zip(curve.miss_ratio())
+                .filter(|(point, _)| **point <= size)
+                .next_back()
+                .map_or(1.0, |(_, ratio)| *ratio);
+            assert_eq!(curve.miss_ratio_at(size), expected, "at cache size {size}");
+        }
     }
 }
