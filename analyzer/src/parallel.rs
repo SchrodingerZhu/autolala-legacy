@@ -802,7 +802,7 @@ fn quantize_gamma(
     }
     let threads = f64::from(threads);
     let shape = reuse_interval * (1.0 - 1.0 / threads);
-    if !(shape > 0.0) {
+    if shape <= 0.0 || shape.is_nan() {
         // One thread, or a zero-length window: nothing dilates it.
         out.push((reuse_interval, weight));
         return Ok(());
