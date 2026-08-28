@@ -7,13 +7,23 @@ One panel per (kernel, thread count). Each panel carries three curves:
                        histogram -- no model of any kind
   Denning(measured RI) the sampler's measured reuse *intervals* pushed through
                        the same Denning recursion the analytical model uses
-  CRI model            the analytical prediction
+  CRI model            the analytical prediction, derived at this thread count
+  scaled from T=4      the same laws applied to the distribution derived once at
+                       the base thread count, with no further polyhedral work
+                       (drawn only above the base)
 
 The middle curve is the one that makes the figure diagnostic rather than
 decorative. Distance from it to `CRI model` is the error of the concurrent-
 reuse-interval model; distance from it to `exact LRU` is the error of the
 reuse-interval-to-reuse-distance conversion. A prediction can be wrong in either
 place, and the two call for completely different fixes.
+
+The fourth curve tests whether the analysis is parametric in the thread count. At
+a fixed chunk the extracted reuse-interval distribution does not depend on T, so
+one derivation should serve every thread count. Where `scaled` sits on top of
+`CRI model`, it does. Where it separates, the culprit is the sharing degree:
+scaling assumes every shared datum is touched by all T threads, and a stencil
+halo is touched by three however large T gets.
 
 Usage:
     scripts/plot-parallel-validation.py                  # chunk=auto, block=1
@@ -24,7 +34,9 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import json
 import sys
+import tempfile
 from pathlib import Path
 
 import matplotlib
@@ -52,8 +64,10 @@ _spec.loader.exec_module(_validate)
 SERIES = [
     ("exact LRU (measured reuse distance)", "#2a78d6", "-", 2.0),
     ("Denning (measured reuse interval)", "#eb6834", (0, (5, 2)), 1.8),
-    ("CRI model (prediction)", "#4a3aa7", (0, (1.5, 1.5)), 1.8),
+    ("CRI model (derived at this T)", "#4a3aa7", (0, (1.5, 1.5)), 1.8),
+    ("CRI model (scaled from base T, no re-derivation)", "#1baf7a", (0, (6, 2, 1.5, 2)), 1.8),
 ]
+KEYS = ("exact", "from_ri", "model", "scaled")
 
 INK_PRIMARY = "#0b0b0b"
 INK_SECONDARY = "#52514e"
@@ -61,21 +75,35 @@ INK_MUTED = "#8a8985"
 SURFACE = "#fcfcfb"
 
 
-def collect(kernel: str, threads: int, chunk: str, block_size: int) -> dict:
+def evaluate_curve(report: dict, sizes: list) -> list:
+    curve = report["miss_ratio_curve"]
+    return [
+        _validate.step_lookup(curve["turning_points"], curve["miss_ratio"], size)
+        for size in sizes
+    ]
+
+
+def collect(kernel: str, threads: int, chunk: str, block_size: int,
+            base_report: Path | None) -> dict:
     """Runs both tools and returns everything the panel needs."""
     measured = _validate.sample(kernel, threads, chunk, block_size)
     predicted = _validate.model(kernel, threads, chunk, block_size)
 
     curves = measured["miss_ratio_curves"]
     sizes = curves["cache_sizes"]
-    curve = predicted["miss_ratio_curve"]
-    model_curve = [
-        _validate.step_lookup(curve["turning_points"], curve["miss_ratio"], size)
-        for size in sizes
-    ]
+    model_curve = evaluate_curve(predicted, sizes)
     parallel = predicted["parallel"]
 
+    scaled_curve = None
+    scaled_vs_model = None
+    if base_report is not None:
+        scaled = _validate.model_scaled(base_report, threads, chunk)
+        scaled_curve = evaluate_curve(scaled, sizes)
+        scaled_vs_model = _validate.mean_absolute_error(scaled_curve, model_curve)
+
     return {
+        "scaled": scaled_curve,
+        "scaled_vs_model": scaled_vs_model,
         "sizes": sizes,
         "exact": curves["exact"],
         "from_ri": curves["from_reuse_interval"],
@@ -98,7 +126,7 @@ def draw_panel(axis, panel: dict, kernel: str, threads: int) -> None:
     keep = [index for index, size in enumerate(sizes) if size >= 1.0]
     x = [sizes[index] for index in keep]
 
-    for (label, color, dash, width), key in zip(SERIES, ("exact", "from_ri", "model")):
+    for (label, color, dash, width), key in zip(SERIES, KEYS):
         values = panel[key]
         if values is None:
             continue
@@ -146,6 +174,8 @@ def draw_panel(axis, panel: dict, kernel: str, threads: int) -> None:
         f"MAE conversion              {panel['conversion']:.4f}\n"
         f"MAE model vs exact          {panel['model_vs_exact']:.4f}"
     )
+    if panel["scaled_vs_model"] is not None:
+        errors += f"\nMAE scaled vs derived      {panel['scaled_vs_model']:.4f}"
     axis.text(
         0.985, 0.97, errors, transform=axis.transAxes, fontsize=6.6,
         color=INK_SECONDARY, va="top", ha="right", family="monospace",
@@ -159,9 +189,13 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--kernels", default=",".join(_validate.KERNELS))
-    parser.add_argument("--threads", default="2,4,8")
-    parser.add_argument("--chunk", default="auto",
-                        help="`auto` is OpenMP's default schedule(static)")
+    parser.add_argument("--threads", default="2,4,8,16,32,64")
+    parser.add_argument("--chunk", default="1",
+                        help="fixed chunk; the parametric claim holds only at a "
+                             "fixed chunk, since `auto` changes the partition "
+                             "geometry with T")
+    parser.add_argument("--base-threads", type=int, default=4,
+                        help="thread count the scaled curve is derived at")
     parser.add_argument("--block-size", type=int, default=1)
     parser.add_argument("--out", default=str(REPO / "results" / "parallel"))
     args = parser.parse_args()
@@ -175,13 +209,24 @@ def main() -> int:
     thread_counts = [int(value) for value in args.threads.split(",")]
 
     panels: dict[tuple[str, int], dict] = {}
-    for kernel in kernels:
-        for threads in thread_counts:
-            print(f"  running {kernel} T={threads} ...", file=sys.stderr)
-            panels[(kernel, threads)] = collect(kernel, threads, args.chunk, args.block_size)
+    with tempfile.TemporaryDirectory() as scratch:
+        for kernel in kernels:
+            # One derivation per kernel, at the base thread count; every panel
+            # above it reuses this rather than re-deriving.
+            base = Path(scratch) / f"{kernel}-base.json"
+            base.write_text(
+                json.dumps(_validate.model(kernel, args.base_threads, args.chunk,
+                                           args.block_size))
+            )
+            for threads in thread_counts:
+                print(f"  running {kernel} T={threads} ...", file=sys.stderr)
+                panels[(kernel, threads)] = collect(
+                    kernel, threads, args.chunk, args.block_size,
+                    base if threads > args.base_threads else None,
+                )
 
     rows, cols = len(kernels), len(thread_counts)
-    figure, axes = plt.subplots(rows, cols, figsize=(4.9 * cols, 3.15 * rows),
+    figure, axes = plt.subplots(rows, cols, figsize=(4.3 * cols, 2.95 * rows),
                                 squeeze=False)
     figure.patch.set_facecolor(SURFACE)
 
@@ -208,14 +253,15 @@ def main() -> int:
         f"fully-associative LRU   ·   uniform interleaving, seed 1   ·   "
         f"{len(panels)} configurations   ·   "
         f"mean MAE {sum(overall) / len(overall):.4f} (CRI model), "
-        f"{sum(end_to_end) / len(end_to_end):.4f} (end to end)",
+        f"{sum(end_to_end) / len(end_to_end):.4f} (end to end)   ·   "
+        f"scaled curve reuses one derivation at T = {args.base_threads}",
         fontsize=8.8, color=INK_SECONDARY, ha="left", va="top",
     )
 
     handles = [Line2D([0], [0], color=color, linestyle=dash, linewidth=width, label=label)
                for label, color, dash, width in SERIES]
-    figure.legend(handles=handles, loc="upper right", bbox_to_anchor=(0.995, 0.999),
-                  ncol=3, frameon=False, fontsize=9, labelcolor=INK_SECONDARY)
+    figure.legend(handles=handles, loc="upper right", bbox_to_anchor=(0.995, 1.0),
+                  ncol=2, frameon=False, fontsize=9, labelcolor=INK_SECONDARY)
 
     figure.tight_layout(rect=(0, 0, 1, 0.965))
     figure.subplots_adjust(hspace=0.42, wspace=0.2)

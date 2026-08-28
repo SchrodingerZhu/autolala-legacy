@@ -115,6 +115,24 @@ def model(kernel: str, threads: int, chunk: str, block_size: int) -> dict:
     return json.loads(run(cmd).strip().splitlines()[-1])
 
 
+def model_scaled(base_report: Path, threads: int, chunk: str) -> dict:
+    """Re-applies the CRI laws at `threads` from a report derived at another
+    thread count, doing no polyhedral work.
+
+    This is the parametric-in-T path, and it assumes each shared datum is
+    touched by all T threads -- what PLUSS assumes. Its gap to a full
+    re-derivation is what that assumption costs.
+    """
+    cmd = [
+        str(ANALYZER), "--json", "barvinok",
+        "--threads", str(threads),
+        "--scale-from", str(base_report),
+    ]
+    if chunk != "auto":
+        cmd += ["--chunk", chunk]
+    return json.loads(run(cmd).strip().splitlines()[-1])
+
+
 def step_lookup(turning_points: list[float], miss_ratio: list[float], size: float) -> float:
     """Miss ratio at `size`, mirroring `denning::MissRatioCurve::miss_ratio_at`."""
     chosen = 1.0

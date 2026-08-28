@@ -39,7 +39,7 @@ use barvinok::{
     DimType, constraint::Constraint, local_space::LocalSpace, map::Map, set::Set,
 };
 use raffine::tree::Tree;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::isl;
 
@@ -301,7 +301,7 @@ pub struct CriKnobs {
 }
 
 /// Outcome of a parallel analysis.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParallelReport {
     pub threads: u32,
     pub chunk: i64,
@@ -318,6 +318,14 @@ pub struct ParallelReport {
     /// thread count when a shared array is swept by everyone, and far below it
     /// for neighbour-only sharing such as a stencil halo.
     pub mean_sharing_degree: f64,
+    /// The reuse-interval distribution *before* any CRI law is applied, as
+    /// `(reuse interval, portion of all accesses, shared)`.
+    ///
+    /// This is the quantity a symbolic-in-`T` pipeline would cache: the laws
+    /// downstream are closed forms in `T`, so if this is invariant across thread
+    /// counts it need only be derived once. Exposed so that invariance can be
+    /// checked rather than assumed.
+    pub reuse_interval_distribution: Vec<(f64, f64, bool)>,
     /// `(CRI, portion)` support, ready for `denning::MissRatioCurve::new`.
     pub support: Vec<(isize, f64)>,
 }
@@ -417,11 +425,13 @@ pub fn analyze<'ctx>(
     let unshared_reuse = private_reuse.intersect_domain(private_times)?;
 
     let mut expansion = Vec::new();
+    let mut reuse_interval_distribution = Vec::new();
     let mut shared_portion = 0.0;
     let mut private_portion = 0.0;
 
     for (reuse_interval, portion) in distribution_of(unshared_reuse, total.clone())? {
         private_portion += portion;
+        reuse_interval_distribution.push((reuse_interval, portion, false));
         expand(
             &mut expansion,
             reuse_interval,
@@ -436,6 +446,7 @@ pub fn analyze<'ctx>(
 
     for (reuse_interval, portion) in distribution_of(shared_reuse, total)? {
         shared_portion += portion;
+        reuse_interval_distribution.push((reuse_interval, portion, true));
         if degree_mass <= 0.0 {
             // No degree information: fall back to the paper's assumption that
             // every thread shares.
@@ -478,6 +489,84 @@ pub fn analyze<'ctx>(
         shared_portion,
         cold_portion: (1.0 - private_portion - shared_portion).max(0.0),
         mean_sharing_degree,
+        reuse_interval_distribution,
+        support: to_denning_support(expansion),
+    })
+}
+
+/// Re-applies the CRI laws at a new thread count, reusing a distribution that
+/// was derived once.
+///
+/// At a fixed chunk the extracted reuse-interval distribution does not depend on
+/// the thread count -- ownership is cyclic with period `T`, so which accesses a
+/// thread sees, and how far apart, is the same pattern at every `T`. Only the
+/// laws downstream consume `T`, and they are closed forms. One derivation
+/// therefore serves every thread count, which is the sense in which the analysis
+/// is parametric in parallelism.
+///
+/// What does *not* carry over is the sharing degree: how many threads touch a
+/// datum is genuinely `T`-dependent, and not always equal to `T`. This function
+/// assumes it is `T` -- the assumption PLUSS makes -- so comparing its output
+/// against a full re-derivation isolates exactly what that assumption costs. On
+/// a stencil, where the degree saturates at the halo width, it costs a lot.
+pub fn rescale(path: &std::path::Path, threads: u32, knobs: &CriKnobs) -> Result<ParallelReport> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|error| anyhow!("reading {}: {error}", path.display()))?;
+    let document: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|error| anyhow!("{} is not a JSON report: {error}", path.display()))?;
+    let Some(source) = document.get("parallel") else {
+        bail!(
+            "{} has no `parallel` section; it must come from `analyzer --json ... \
+             --parallel-loop-depth`",
+            path.display()
+        );
+    };
+    let source: ParallelReport = serde_json::from_value(source.clone())
+        .map_err(|error| anyhow!("{} has an unreadable parallel report: {error}", path.display()))?;
+    if source.reuse_interval_distribution.is_empty() {
+        bail!(
+            "{} carries no reuse-interval distribution; it predates the parametric path",
+            path.display()
+        );
+    }
+
+    let mut expansion = Vec::new();
+    let mut private_portion = 0.0;
+    let mut shared_portion = 0.0;
+    for (reuse_interval, portion, is_shared) in source.reuse_interval_distribution.iter().copied() {
+        let sharing = if is_shared {
+            shared_portion += portion;
+            Sharing::Shared { sharers: threads }
+        } else {
+            private_portion += portion;
+            Sharing::Private
+        };
+        expand(
+            &mut expansion,
+            reuse_interval,
+            portion,
+            sharing,
+            threads,
+            knobs.short_bound,
+            knobs.racetrack_bins,
+            knobs.nbd_epsilon,
+        )?;
+    }
+
+    Ok(ParallelReport {
+        threads,
+        chunk: source.chunk,
+        short_ri_bound: knobs.short_bound,
+        private_portion,
+        shared_portion,
+        cold_portion: (1.0 - private_portion - shared_portion).max(0.0),
+        // Assumed, not measured -- that is the point of this path.
+        mean_sharing_degree: if shared_portion > 0.0 {
+            f64::from(threads)
+        } else {
+            0.0
+        },
+        reuse_interval_distribution: source.reuse_interval_distribution,
         support: to_denning_support(expansion),
     })
 }

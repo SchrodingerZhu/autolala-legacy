@@ -106,10 +106,36 @@ cargo run --release -p analyzer -- --input parallel-sampler/misc/matmul_128.mlir
   barvinok --parallel-loop-depth 0 --threads 8 --chunk 1
 ```
 
+### Parametric in the thread count
+
+`T` cannot be symbolic inside the polyhedral model: `tid = (k / chunk) mod T`
+needs `chunk*T` as an integer coefficient, and promoting `T` to a parameter makes
+that a product of two unknowns. It does not need to be. At a fixed chunk the
+extracted reuse-interval distribution is *bit-identical* across thread counts
+(verified over four kernels at `T` = 2, 4, 8, 16, L1 difference exactly zero), so
+one derivation serves every `T` and only the closed-form laws consume it:
+
+```bash
+# derive once
+cargo run --release -p analyzer -- --input parallel-sampler/misc/matmul_128.mlir \
+  --json barvinok --parallel-loop-depth 0 --threads 4 --chunk 1 > base.json
+
+# then any thread count, with no polyhedral work (~5 ms instead of ~350 ms)
+cargo run --release -p analyzer -- --json barvinok --threads 64 --chunk 1 \
+  --scale-from base.json
+```
+
+The one quantity that genuinely depends on `T` is the sharing degree — how many
+threads touch each datum. `--scale-from` assumes it is `T`, which is what PLUSS
+assumes; running without the flag measures it instead. The two agree exactly
+where every thread really does sweep the shared data, and diverge on a stencil,
+where the degree saturates at the halo width however large `T` grows.
+
 ### Validating one against the other
 
 ```bash
-scripts/validate-parallel.py           # writes results/parallel/validation.json
+scripts/validate-parallel.py            # writes results/parallel/validation.json
+scripts/plot-parallel-validation.py     # writes the multi-panel comparison figure
 ```
 
 Errors are reported in three parts — the CRI model, the reuse-interval-to-

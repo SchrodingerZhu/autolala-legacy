@@ -104,6 +104,17 @@ enum Method {
         /// ones use the concentrated law. Defaults to Theorem 3.1's bound.
         #[arg(long)]
         short_ri_bound: Option<f64>,
+        /// Reuse the reuse-interval distribution from a previous `--json`
+        /// report instead of re-deriving it, and apply the CRI laws at
+        /// `--threads`. No polyhedral work is done.
+        ///
+        /// This is the parametric-in-`T` path: at a fixed chunk the extracted
+        /// distribution does not depend on the thread count, so one derivation
+        /// serves every `T`. It assumes each shared datum is touched by all `T`
+        /// threads, which is what PLUSS assumes; run without this flag to get
+        /// the measured sharing degree instead.
+        #[arg(long)]
+        scale_from: Option<PathBuf>,
     },
     /// Use the PerfectTiling algorithm to compute the polyhedral model
     Salt {
@@ -325,8 +336,50 @@ fn main_entry() -> anyhow::Result<()> {
             racetrack_bins,
             nbd_epsilon,
             short_ri_bound,
+            scale_from,
         } => AnalysisContext::start_with_args(barvinok_arg.as_slice(), |context| {
             let context = &context;
+            // The parametric path: no MLIR, no barvinok, just the closed-form
+            // laws over a distribution derived once at some other thread count.
+            if let Some(path) = scale_from {
+                let short_bound = match short_ri_bound {
+                    Some(bound) => *bound,
+                    None => parallel::ShortBound::default().value()?,
+                };
+                let report = parallel::rescale(
+                    path,
+                    threads.get(),
+                    &parallel::CriKnobs {
+                        short_bound,
+                        racetrack_bins: racetrack_bins.get(),
+                        nbd_epsilon: *nbd_epsilon,
+                    },
+                )?;
+                let mut curve = denning::MissRatioCurve::new(&report.support);
+                if options.associativity.get() > 1 {
+                    curve = curve.compute_assoc(
+                        options.associativity.get(),
+                        1.0,
+                        denning::SkewDecay::Constant,
+                    );
+                }
+                if options.json {
+                    let output = serde_json::json!({
+                        "parallel": &report,
+                        "miss_ratio_curve": &curve,
+                        "elapsed_seconds": start_time.elapsed().as_secs_f64(),
+                    });
+                    writeln!(writer, "{output}")?;
+                } else {
+                    writeln!(
+                        writer,
+                        "rescaled to {} thread(s) from {} without re-deriving the distribution",
+                        report.threads,
+                        path.display()
+                    )?;
+                }
+                return Ok(());
+            }
             context.bcontext().set_max_operations(*max_operations);
             let (source, from_c) = obtain_mlir_source(&options, &mut reader)?;
             if from_c {
