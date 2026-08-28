@@ -337,7 +337,7 @@ pub fn round_robin_order<'ctx>(
     let local_space: LocalSpace = map_space.clone().try_into()?;
     let mut reorder: Map<'ctx> = BasicMap::universe(map_space)?.try_into()?;
 
-    let mut carry = |reorder: Map<'ctx>, out: usize, input: usize| -> Result<Map<'ctx>> {
+    let carry = |reorder: Map<'ctx>, out: usize, input: usize| -> Result<Map<'ctx>> {
         Ok(reorder.add_constraint(
             Constraint::new_equality(local_space.clone())?
                 .set_coefficient_si(DimType::Out, out as i32, 1)?
