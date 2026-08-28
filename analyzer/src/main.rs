@@ -373,18 +373,24 @@ fn main_entry() -> anyhow::Result<()> {
                         dilation: parse_dilation(dilation)?,
                     },
                 )?;
-                let mut curve = denning::MissRatioCurve::new(&report.support);
-                if options.associativity.get() > 1 {
-                    curve = curve.compute_assoc(
-                        options.associativity.get(),
-                        1.0,
-                        denning::SkewDecay::Constant,
-                    );
-                }
+                let assoc = |support: &[(isize, f64)]| {
+                    let mut curve = denning::MissRatioCurve::new(support);
+                    if options.associativity.get() > 1 {
+                        curve = curve.compute_assoc(
+                            options.associativity.get(),
+                            1.0,
+                            denning::SkewDecay::Constant,
+                        );
+                    }
+                    curve
+                };
+                let curve = assoc(&report.support);
+                let coupled = assoc(&report.coupled_support);
                 if options.json {
                     let output = serde_json::json!({
                         "parallel": &report,
                         "miss_ratio_curve": &curve,
+                        "miss_ratio_curve_coupled": &coupled,
                         "elapsed_seconds": start_time.elapsed().as_secs_f64(),
                     });
                     writeln!(writer, "{output}")?;
@@ -531,22 +537,29 @@ fn main_entry() -> anyhow::Result<()> {
                 let report = parallel::analyze(
                     space.clone(),
                     access_map.clone(),
+                    parallel::timestamp_dim_of_loop(tree, spec.loop_level)?,
                     *thread_dim,
                     spec,
                     &knobs,
                 )?;
-                let mut curve = denning::MissRatioCurve::new(&report.support);
-                if options.associativity.get() > 1 {
-                    curve = curve.compute_assoc(
-                        options.associativity.get(),
-                        1.0,
-                        denning::SkewDecay::Constant,
-                    );
-                }
+                let assoc = |support: &[(isize, f64)]| {
+                    let mut curve = denning::MissRatioCurve::new(support);
+                    if options.associativity.get() > 1 {
+                        curve = curve.compute_assoc(
+                            options.associativity.get(),
+                            1.0,
+                            denning::SkewDecay::Constant,
+                        );
+                    }
+                    curve
+                };
+                let curve = assoc(&report.support);
+                let coupled = assoc(&report.coupled_support);
                 if options.json {
                     let output = serde_json::json!({
                         "parallel": &report,
                         "miss_ratio_curve": &curve,
+                        "miss_ratio_curve_coupled": &coupled,
                         "elapsed_seconds": start_time.elapsed().as_secs_f64(),
                     });
                     writeln!(writer, "{output}")?;
@@ -567,6 +580,12 @@ fn main_entry() -> anyhow::Result<()> {
                         report.mean_sharing_degree, report.threads
                     )?;
                     writeln!(writer, "CRI support points: {}", report.support.len())?;
+                    writeln!(
+                        writer,
+                        "coupled limit (round-robin schedule): {} support point(s), {:.4} compulsory",
+                        report.coupled_support.len(),
+                        report.coupled_cold_portion
+                    )?;
                 }
                 if let Some(path) = &options.miss_ratio_curve {
                     let svgbackend = plotters::backend::SVGBackend::new(

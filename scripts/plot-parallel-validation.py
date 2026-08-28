@@ -12,6 +12,14 @@ One panel per (kernel, thread count). Each panel carries three curves:
                        the base thread count, with no further polyhedral work
                        (drawn only above the base)
 
+The shaded band spans the model's two computable limits. Its upper edge is the
+steady-state law -- the racetrack, which is the *stationary* distribution of the
+thread-gap chain and so describes threads that have had time to decorrelate. Its
+other edge is the coupled limit: the reuse relation read straight off the
+deterministic round-robin schedule, describing threads that have not. A real
+execution lies between them, and where it lies is a property of the machine
+rather than of the program, so the band is the portable answer.
+
 The middle curve is the one that makes the figure diagnostic rather than
 decorative. Distance from it to `CRI model` is the error of the concurrent-
 reuse-interval model; distance from it to `exact LRU` is the error of the
@@ -44,6 +52,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -75,12 +84,15 @@ INK_MUTED = "#8a8985"
 SURFACE = "#fcfcfb"
 
 
-def evaluate_curve(report: dict, sizes: list) -> list:
-    curve = report["miss_ratio_curve"]
+def evaluate_curve_from(curve: dict, sizes: list) -> list:
     return [
         _validate.step_lookup(curve["turning_points"], curve["miss_ratio"], size)
         for size in sizes
     ]
+
+
+def evaluate_curve(report: dict, sizes: list) -> list:
+    return evaluate_curve_from(report["miss_ratio_curve"], sizes)
 
 
 def collect(kernel: str, threads: int, chunk: str, block_size: int,
@@ -94,6 +106,8 @@ def collect(kernel: str, threads: int, chunk: str, block_size: int,
     model_curve = evaluate_curve(predicted, sizes)
     parallel = predicted["parallel"]
 
+    coupled_curve = evaluate_curve_from(predicted["miss_ratio_curve_coupled"], sizes)
+
     scaled_curve = None
     scaled_vs_model = None
     if base_report is not None:
@@ -101,7 +115,19 @@ def collect(kernel: str, threads: int, chunk: str, block_size: int,
         scaled_curve = evaluate_curve(scaled, sizes)
         scaled_vs_model = _validate.mean_absolute_error(scaled_curve, model_curve)
 
+    # Where the measured curve sits inside the band: 0 at the steady-state edge,
+    # 1 at the coupled edge.
+    # Only where the band is wide enough for a position to mean anything; a
+    # ratio taken across a degenerate band is noise, not information.
+    positions = [
+        (m - s) / (c - s)
+        for m, s, c in zip(curves["from_reuse_interval"], model_curve, coupled_curve)
+        if abs(c - s) > 0.05
+    ]
+
     return {
+        "coupled": coupled_curve,
+        "band_position": sum(positions) / len(positions) if positions else float("nan"),
         "scaled": scaled_curve,
         "scaled_vs_model": scaled_vs_model,
         "sizes": sizes,
@@ -125,6 +151,16 @@ def draw_panel(axis, panel: dict, kernel: str, threads: int) -> None:
     # flat at 1.0 there anyway.
     keep = [index for index, size in enumerate(sizes) if size >= 1.0]
     x = [sizes[index] for index in keep]
+
+    # The band between the two computable limits.
+    if panel["coupled"] is not None:
+        axis.fill_between(
+            x,
+            [panel["model"][index] for index in keep],
+            [panel["coupled"][index] for index in keep],
+            color="#8a8985", alpha=0.16, linewidth=0, zorder=1,
+            label="model interval (coupled to steady state)",
+        )
 
     for (label, color, dash, width), key in zip(SERIES, KEYS):
         values = panel[key]
@@ -176,6 +212,10 @@ def draw_panel(axis, panel: dict, kernel: str, threads: int) -> None:
     )
     if panel["scaled_vs_model"] is not None:
         errors += f"\nMAE scaled vs derived      {panel['scaled_vs_model']:.4f}"
+    if panel["band_position"] == panel["band_position"]:
+        errors += f"\nmeasured sits at           {panel['band_position']:.2f} of band"
+    else:
+        errors += "\nband is degenerate (limits agree)"
     axis.text(
         0.985, 0.97, errors, transform=axis.transAxes, fontsize=6.6,
         color=INK_SECONDARY, va="top", ha="right", family="monospace",
@@ -260,6 +300,8 @@ def main() -> int:
 
     handles = [Line2D([0], [0], color=color, linestyle=dash, linewidth=width, label=label)
                for label, color, dash, width in SERIES]
+    handles.append(Patch(facecolor="#8a8985", alpha=0.16,
+                         label="model interval: coupled to steady state"))
     figure.legend(handles=handles, loc="upper right", bbox_to_anchor=(0.995, 1.0),
                   ncol=2, frameon=False, fontsize=9, labelcolor=INK_SECONDARY)
 

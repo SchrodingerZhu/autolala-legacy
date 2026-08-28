@@ -131,6 +131,32 @@ assumes; running without the flag measures it instead. The two agree exactly
 where every thread really does sweep the shared data, and diverge on a stencil,
 where the degree saturates at the halo width however large `T` grows.
 
+### Two limits, not one prediction
+
+The racetrack is a *steady-state* law: its density is the stationary
+distribution of the thread-gap Markov chain, so it describes threads that have
+had time to decorrelate. A shared datum with a long traversal never reaches that
+equilibrium inside a run -- its sharers are still coupled, following the
+schedule. Applying an equilibrium result there is what produces matmul's visible
+offset.
+
+The analysis therefore reports both endpoints, and `--json` carries both curves:
+
+  * `miss_ratio_curve` -- the steady-state laws.
+  * `miss_ratio_curve_coupled` -- the reuse relation read straight off the
+    deterministic round-robin schedule. Under a deterministic schedule the reuse
+    relation *is* the concurrent reuse interval, so no statistical law appears
+    anywhere; it is a polyhedral computation over a reordering of the same
+    timestamp space, exact on unguarded nests.
+
+Neither endpoint needs a fitted constant, so the interval is portable. Collapsing
+it to a single curve would need one number describing how fast threads
+decorrelate on the target machine -- a property of the machine, not of the
+program, and not something this analysis can compute. Measured against realistic
+(uniform) interleaving the steady-state curve is the better single predictor on
+every kernel tested, so it stays the default; the coupled edge bounds how far
+wrong it can be.
+
 ### Two laws for the dilated window
 
 A reuse window that no other thread intercepts simply stretches, and there are
