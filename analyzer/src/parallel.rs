@@ -36,12 +36,7 @@
 
 use anyhow::{Result, anyhow, bail};
 use barvinok::{
-    DimType,
-    constraint::Constraint,
-    local_space::LocalSpace,
-    map::{BasicMap, Map},
-    set::Set,
-    space::Space,
+    DimType, constraint::Constraint, local_space::LocalSpace, map::Map, set::Set,
 };
 use raffine::tree::Tree;
 use serde::{Deserialize, Serialize};
@@ -285,99 +280,6 @@ pub fn add_thread_dim<'ctx>(
     Ok((space, thread_dim))
 }
 
-/// Reorders the timestamp space from program order into round-robin execution
-/// order, and returns the reordered space with the index of its thread
-/// dimension.
-///
-/// Under a deterministic round-robin schedule every thread advances one access
-/// at a time, so the global order is `(own step, tid)`. A thread's own step is
-/// its progress through its own chunks: with `k = chunk*(q*T + tid) + o`, that
-/// is `(q, o, inner dims)`. Replacing `k` by `(q, o)` in place and leaving `tid`
-/// last therefore makes plain lexicographic order *be* round-robin order.
-///
-/// The construction assumes every thread has an access at each `(q, o, inner)`
-/// step. A guard inside the nest breaks that -- with `affine.if` some threads
-/// skip iterations others take, so lexicographic order stops being round-robin
-/// order and the result drifts from the schedule it is meant to describe. It is
-/// exact on unguarded nests and approximate otherwise.
-///
-/// This matters because it turns the coupled regime into a computation rather
-/// than a model. The racetrack is the *stationary* distribution of the
-/// thread-gap chain, so it describes threads that have had time to decorrelate.
-/// Threads that have not are still following the schedule, and the schedule is
-/// known exactly -- the reuse relation over this order counts every access in
-/// the window and so yields the concurrent reuse interval directly, with no
-/// distribution assumed anywhere.
-pub fn round_robin_order<'ctx>(
-    space: Set<'ctx>,
-    ts_dim: usize,
-    thread_dim: usize,
-    spec: &ParallelSpec,
-) -> Result<(Set<'ctx>, Map<'ctx>, usize)> {
-    let threads = i64::from(spec.threads);
-    let chunk = spec.chunk;
-    let stride = chunk
-        .checked_mul(threads)
-        .ok_or_else(|| anyhow!("chunk {chunk} times {threads} threads overflows"))?;
-
-    let in_dims = thread_dim + 1;
-    let out_dims = in_dims + 1;
-    let inner = thread_dim - ts_dim - 1;
-    let quotient = ts_dim;
-    let offset = ts_dim + 1;
-    let out_thread = out_dims - 1;
-
-    let params = space.n_param()?;
-    let map_space = Space::new(
-        space.get_space()?.context_ref(),
-        params,
-        in_dims as u32,
-        out_dims as u32,
-    )?;
-    let local_space: LocalSpace = map_space.clone().try_into()?;
-    let mut reorder: Map<'ctx> = BasicMap::universe(map_space)?.try_into()?;
-
-    let carry = |reorder: Map<'ctx>, out: usize, input: usize| -> Result<Map<'ctx>> {
-        Ok(reorder.add_constraint(
-            Constraint::new_equality(local_space.clone())?
-                .set_coefficient_si(DimType::Out, out as i32, 1)?
-                .set_coefficient_si(DimType::In, input as i32, -1)?,
-        )?)
-    };
-    // Dimensions enclosing the parallel loop are shared by every thread and
-    // keep their place.
-    for dim in 0..ts_dim {
-        reorder = carry(reorder, dim, dim)?;
-    }
-    // Dimensions inside it shift right by one, to make room for `o`.
-    for dim in 0..inner {
-        reorder = carry(reorder, ts_dim + 2 + dim, ts_dim + 1 + dim)?;
-    }
-    reorder = carry(reorder, out_thread, thread_dim)?;
-
-    // k = chunk*T*q + chunk*tid + o
-    reorder = reorder.add_constraint(
-        Constraint::new_equality(local_space.clone())?
-            .set_coefficient_si(DimType::In, ts_dim as i32, 1)?
-            .set_coefficient_si(DimType::Out, quotient as i32, -(stride as i32))?
-            .set_coefficient_si(DimType::In, thread_dim as i32, -(chunk as i32))?
-            .set_coefficient_si(DimType::Out, offset as i32, -1)?,
-    )?;
-    // 0 <= o <= chunk - 1
-    reorder = reorder.add_constraint(
-        Constraint::new_inequality(local_space.clone())?
-            .set_coefficient_si(DimType::Out, offset as i32, 1)?,
-    )?;
-    reorder = reorder.add_constraint(
-        Constraint::new_inequality(local_space)?
-            .set_coefficient_si(DimType::Out, offset as i32, -1)?
-            .set_constant_si((chunk - 1) as i32)?,
-    )?;
-
-    let reordered = crate::isl::ensure_set_name(space.apply(reorder.clone())?)?;
-    Ok((reordered, reorder, out_thread))
-}
-
 /// Relation holding pairs of timestamps executed by the same thread.
 ///
 /// With the thread identity materialized at dimension 0 by [`add_thread_dim`],
@@ -461,22 +363,8 @@ pub struct ParallelReport {
     /// counts it need only be derived once. Exposed so that invariance can be
     /// checked rather than assumed.
     pub reuse_interval_distribution: Vec<(f64, f64, bool)>,
-    /// `(CRI, portion)` support under the steady-state laws, ready for
-    /// `denning::MissRatioCurve::new`.
+    /// `(CRI, portion)` support, ready for `denning::MissRatioCurve::new`.
     pub support: Vec<(isize, f64)>,
-    /// The same, for the coupled limit: the concurrent reuse interval read
-    /// straight off the deterministic round-robin schedule, with no statistical
-    /// law applied anywhere.
-    ///
-    /// The two are the endpoints of the model, not competitors. The racetrack
-    /// describes threads that have decorrelated; this describes threads that
-    /// have not. A real execution sits between them, and how close it sits to
-    /// each is a property of the machine rather than of the program -- so
-    /// reporting both is the portable answer, and collapsing them to one needs
-    /// an environment parameter this analysis cannot compute.
-    pub coupled_support: Vec<(isize, f64)>,
-    /// Portion of accesses with no prior access at all under the coupled order.
-    pub coupled_cold_portion: f64,
 }
 
 /// Runs the parallel pipeline over a thread-extended timestamp space.
@@ -485,43 +373,13 @@ pub struct ParallelReport {
 /// [`add_thread_dim`]. The reuse construction mirrors the sequential one in
 /// `main_entry`, with every order relation restricted to a single thread so
 /// that what it counts is the *private* reuse interval.
-#[allow(clippy::too_many_arguments)]
 pub fn analyze<'ctx>(
     space: Set<'ctx>,
     access_map: Map<'ctx>,
-    ts_dim: usize,
     thread_dim: usize,
     spec: &ParallelSpec,
     knobs: &CriKnobs,
 ) -> Result<ParallelReport> {
-    // The coupled limit first: reorder the space into round-robin execution
-    // order and count reuse over it. No law is involved -- under a
-    // deterministic schedule the reuse relation *is* the concurrent reuse
-    // interval.
-    let (coupled_space, reorder, _) =
-        round_robin_order(space.clone(), ts_dim, thread_dim, spec)?;
-    let coupled_access = crate::isl::ensure_map_domain_name(
-        reorder.reverse()?.apply_range(access_map.clone())?,
-    )?
-    .intersect_domain(coupled_space.clone())?;
-    let coupled_total = coupled_space.clone().cardinality()?;
-    let coupled_same = coupled_access
-        .clone()
-        .apply_range(coupled_access.clone().reverse()?)?;
-    let coupled_reuse = reuse_relation(
-        &coupled_same,
-        coupled_space.clone().lex_gt_set(coupled_space.clone())?,
-        coupled_space.clone().lex_ge_set(coupled_space)?,
-    )?;
-    let mut coupled_expansion = Vec::new();
-    let mut coupled_warm = 0.0;
-    for (reuse_interval, portion) in distribution_of(coupled_reuse, coupled_total)? {
-        coupled_warm += portion;
-        coupled_expansion.push((reuse_interval, portion));
-    }
-    let coupled_support = to_denning_support(coupled_expansion);
-    let coupled_cold_portion = (1.0 - coupled_warm).max(0.0);
-
     let total = space.clone().cardinality()?;
 
     let same_element = access_map
@@ -683,8 +541,6 @@ pub fn analyze<'ctx>(
         mean_sharing_degree,
         reuse_interval_distribution,
         support: to_denning_support(expansion),
-        coupled_support,
-        coupled_cold_portion,
     })
 }
 
@@ -761,11 +617,6 @@ pub fn rescale(path: &std::path::Path, threads: u32, knobs: &CriKnobs) -> Result
     Ok(ParallelReport {
         threads,
         chunk: source.chunk,
-        // The coupled limit is a polyhedral computation, not a law, so it
-        // cannot be rescaled from a cached distribution the way the
-        // steady-state laws can.
-        coupled_support: Vec::new(),
-        coupled_cold_portion: 0.0,
         short_ri_bound: knobs.short_bound,
         private_portion,
         shared_portion,

@@ -12,7 +12,6 @@ One panel per (kernel, thread count). Each panel carries three curves:
                        the base thread count, with no further polyhedral work
                        (drawn only above the base)
 
-
 The middle curve is the one that makes the figure diagnostic rather than
 decorative. Distance from it to `CRI model` is the error of the concurrent-
 reuse-interval model; distance from it to `exact LRU` is the error of the
@@ -76,15 +75,12 @@ INK_MUTED = "#8a8985"
 SURFACE = "#fcfcfb"
 
 
-def evaluate_curve_from(curve: dict, sizes: list) -> list:
+def evaluate_curve(report: dict, sizes: list) -> list:
+    curve = report["miss_ratio_curve"]
     return [
         _validate.step_lookup(curve["turning_points"], curve["miss_ratio"], size)
         for size in sizes
     ]
-
-
-def evaluate_curve(report: dict, sizes: list) -> list:
-    return evaluate_curve_from(report["miss_ratio_curve"], sizes)
 
 
 def collect(kernel: str, threads: int, chunk: str, block_size: int,
@@ -98,8 +94,6 @@ def collect(kernel: str, threads: int, chunk: str, block_size: int,
     model_curve = evaluate_curve(predicted, sizes)
     parallel = predicted["parallel"]
 
-    coupled_curve = evaluate_curve_from(predicted["miss_ratio_curve_coupled"], sizes)
-
     scaled_curve = None
     scaled_vs_model = None
     if base_report is not None:
@@ -107,19 +101,7 @@ def collect(kernel: str, threads: int, chunk: str, block_size: int,
         scaled_curve = evaluate_curve(scaled, sizes)
         scaled_vs_model = _validate.mean_absolute_error(scaled_curve, model_curve)
 
-    # Where the measured curve sits inside the band: 0 at the steady-state edge,
-    # 1 at the coupled edge.
-    # Only where the band is wide enough for a position to mean anything; a
-    # ratio taken across a degenerate band is noise, not information.
-    positions = [
-        (m - s) / (c - s)
-        for m, s, c in zip(curves["from_reuse_interval"], model_curve, coupled_curve)
-        if abs(c - s) > 0.05
-    ]
-
     return {
-        "coupled": coupled_curve,
-        "band_position": sum(positions) / len(positions) if positions else float("nan"),
         "scaled": scaled_curve,
         "scaled_vs_model": scaled_vs_model,
         "sizes": sizes,
