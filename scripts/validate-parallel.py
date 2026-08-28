@@ -98,7 +98,8 @@ def sample(kernel: str, threads: int, chunk: str, block_size: int) -> dict:
     return json.loads(run(cmd))
 
 
-def model(kernel: str, threads: int, chunk: str, block_size: int) -> dict:
+def model(kernel: str, threads: int, chunk: str, block_size: int,
+          dilation: str = "hybrid") -> dict:
     cmd = [
         str(ANALYZER),
         "--input", str(MISC / f"{kernel}.mlir"),
@@ -107,6 +108,7 @@ def model(kernel: str, threads: int, chunk: str, block_size: int) -> dict:
         "--parallel-loop-depth", "0",
         "--threads", str(threads),
         "--block-size", str(block_size),
+        "--dilation", dilation,
     ]
     if chunk != "auto":
         cmd += ["--chunk", chunk]

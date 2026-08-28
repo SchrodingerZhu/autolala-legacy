@@ -131,6 +131,21 @@ assumes; running without the flag measures it instead. The two agree exactly
 where every thread really does sweep the shared data, and diverge on a stencil,
 where the degree saturates at the halo width however large `T` grows.
 
+### Two laws for the dilated window
+
+A reuse window that no other thread intercepts simply stretches, and there are
+two ways to say by how much. `NB(r, 1/T)` is exact but its support grows with
+`r`, so beyond the Theorem 3.1 bound the analysis abandons it for a point mass at
+`T*r` and loses the spread; worse, its first term `(1/T)^r` underflows to zero
+past a window of about 170 accesses at 64 threads, so it cannot be expanded there
+at all. `Gamma(shape = r*(1 - 1/T), scale = T)`, shifted by `r`, is the same law
+in continuous form -- both moments match, and it costs a fixed number of buckets
+whatever `r` is.
+
+Neither wins everywhere, so `--dilation hybrid` (the default) takes each where it
+is better: the negative binomial below the bound, where discreteness still
+matters, and the Gamma above it. Pass `nbd` or `gamma` to use one throughout.
+
 ### Validating one against the other
 
 ```bash

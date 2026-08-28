@@ -115,6 +115,13 @@ enum Method {
         /// the measured sharing degree instead.
         #[arg(long)]
         scale_from: Option<PathBuf>,
+        /// How a non-intercepted reuse window's dilation is distributed:
+        /// `hybrid` (the default) uses the negative binomial below the
+        /// Theorem 3.1 bound and the shifted Gamma above it; `nbd` collapses to
+        /// a point mass above the bound instead; `gamma` uses the continuous
+        /// law at every reuse length.
+        #[arg(long, default_value = "hybrid")]
+        dilation: String,
     },
     /// Use the PerfectTiling algorithm to compute the polyhedral model
     Salt {
@@ -294,6 +301,15 @@ where
     })
 }
 
+fn parse_dilation(text: &str) -> anyhow::Result<parallel::DilationLaw> {
+    match text.trim() {
+        "nbd" | "negative-binomial" => Ok(parallel::DilationLaw::NegativeBinomial),
+        "gamma" => Ok(parallel::DilationLaw::Gamma),
+        "hybrid" => Ok(parallel::DilationLaw::Hybrid),
+        other => Err(anyhow!("unknown dilation law `{other}`; expected nbd, gamma or hybrid")),
+    }
+}
+
 fn main_entry() -> anyhow::Result<()> {
     let options = Options::parse();
 
@@ -337,6 +353,7 @@ fn main_entry() -> anyhow::Result<()> {
             nbd_epsilon,
             short_ri_bound,
             scale_from,
+            dilation,
         } => AnalysisContext::start_with_args(barvinok_arg.as_slice(), |context| {
             let context = &context;
             // The parametric path: no MLIR, no barvinok, just the closed-form
@@ -353,6 +370,7 @@ fn main_entry() -> anyhow::Result<()> {
                         short_bound,
                         racetrack_bins: racetrack_bins.get(),
                         nbd_epsilon: *nbd_epsilon,
+                        dilation: parse_dilation(dilation)?,
                     },
                 )?;
                 let mut curve = denning::MissRatioCurve::new(&report.support);
@@ -508,6 +526,7 @@ fn main_entry() -> anyhow::Result<()> {
                     short_bound,
                     racetrack_bins: racetrack_bins.get(),
                     nbd_epsilon: *nbd_epsilon,
+                    dilation: parse_dilation(dilation)?,
                 };
                 let report = parallel::analyze(
                     space.clone(),

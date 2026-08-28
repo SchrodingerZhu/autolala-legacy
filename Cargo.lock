@@ -121,6 +121,7 @@ dependencies = [
  "raffine",
  "serde",
  "serde_json",
+ "statrs",
  "symbolica",
  "tracing",
  "tracing-subscriber",

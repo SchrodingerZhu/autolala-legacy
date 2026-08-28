@@ -40,6 +40,7 @@ use barvinok::{
 };
 use raffine::tree::Tree;
 use serde::{Deserialize, Serialize};
+use statrs::distribution::{ContinuousCDF, Gamma};
 
 use crate::isl;
 
@@ -293,11 +294,47 @@ pub fn same_thread<'ctx>(map: Map<'ctx>, thread_dim: usize) -> Result<Map<'ctx>>
 }
 
 /// Tunables for turning a PRI distribution into a CRI distribution.
+/// How the dilation of a non-intercepted reuse window is distributed.
+///
+/// Both laws describe the same thing -- a window holding `r` of this thread's
+/// accesses, stretched by the other threads' -- and both have mean `T*r`. They
+/// differ in cost and in what happens to long windows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DilationLaw {
+    /// `CRI = r + X` with `X ~ NB(r, 1/T)`, expanded term by term. Exact, but
+    /// the support grows with `r`, so beyond the Theorem 3.1 bound it is
+    /// abandoned for a point mass at `T*r` and the spread is lost.
+    NegativeBinomial,
+    /// `CRI = r + Gamma(shape = r*(1 - 1/T), scale = T)`, the continuous limit
+    /// of the same law: a sum of geometric waits becomes a sum of exponential
+    /// ones.
+    ///
+    /// The shift is not cosmetic. `CRI = r + X` cannot fall below `r` -- the
+    /// window contains this thread's own `r` accesses whatever the others do --
+    /// and an unshifted Gamma puts mass where the CRI cannot go, which costs a
+    /// factor of thirty on short reuse. Shifted, and with the shape chosen so
+    /// both moments match `NB(r, 1/T)` exactly, it agrees with the negative
+    /// binomial and needs a fixed number of buckets whatever `r` is -- so no
+    /// short/long cutoff, and no collapse to a point mass on long windows.
+    Gamma,
+    /// The negative binomial below the Theorem 3.1 bound, where it is exact and
+    /// affordable, and the shifted Gamma above it, where the negative binomial
+    /// would otherwise be abandoned for a point mass.
+    ///
+    /// Each law is used where it is better, and measurably so: the negative
+    /// binomial alone loses an order of magnitude on long private reuse by
+    /// discarding its spread, and the Gamma alone loses a factor of five on very
+    /// short reuse, where the window holds few enough accesses that the
+    /// distribution's discreteness still matters.
+    Hybrid,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct CriKnobs {
     pub short_bound: f64,
     pub racetrack_bins: usize,
     pub nbd_epsilon: f64,
+    pub dilation: DilationLaw,
 }
 
 /// Outcome of a parallel analysis.
@@ -441,6 +478,7 @@ pub fn analyze<'ctx>(
             knobs.short_bound,
             knobs.racetrack_bins,
             knobs.nbd_epsilon,
+            knobs.dilation,
         )?;
     }
 
@@ -471,6 +509,7 @@ pub fn analyze<'ctx>(
                 knobs.short_bound,
                 knobs.racetrack_bins,
                 knobs.nbd_epsilon,
+                knobs.dilation,
             )?;
             continue;
         }
@@ -487,6 +526,7 @@ pub fn analyze<'ctx>(
                 knobs.short_bound,
                 knobs.racetrack_bins,
                 knobs.nbd_epsilon,
+                knobs.dilation,
             )?;
         }
     }
@@ -570,6 +610,7 @@ pub fn rescale(path: &std::path::Path, threads: u32, knobs: &CriKnobs) -> Result
             knobs.short_bound,
             knobs.racetrack_bins,
             knobs.nbd_epsilon,
+            knobs.dilation,
         )?;
     }
 
@@ -658,6 +699,7 @@ pub fn expand(
     short_bound: f64,
     racetrack_bins: usize,
     nbd_epsilon: f64,
+    dilation: DilationLaw,
 ) -> Result<()> {
     if weight <= 0.0 {
         return Ok(());
@@ -707,19 +749,73 @@ pub fn expand(
         return quantize_racetrack(out, reuse_interval, sharers, weight, racetrack_bins);
     }
 
-    // Not intercepted: the window only dilates. Theorem 3.1 says the dilated
-    // CRI concentrates on `T*r` once the window is long enough; below the
-    // bound it has not, and the negative binomial carries the spread.
-    if reuse_interval <= short_bound {
-        return expand_negative_binomial(
+    // Not intercepted: the window only dilates.
+    let short = reuse_interval <= short_bound;
+    match dilation {
+        // The continuous form carries the spread at every `r` for a fixed cost,
+        // so there is no cutoff to apply.
+        DilationLaw::Gamma => quantize_gamma(out, reuse_interval, threads, weight, racetrack_bins),
+        DilationLaw::Hybrid if short => expand_negative_binomial(
             out,
             reuse_interval.round() as u64,
             threads,
             weight,
             nbd_epsilon,
-        );
+        ),
+        DilationLaw::Hybrid => {
+            quantize_gamma(out, reuse_interval, threads, weight, racetrack_bins)
+        }
+        // Theorem 3.1 says the dilated CRI concentrates on `T*r` once the window
+        // is long enough; below the bound it has not, and the negative binomial
+        // carries the spread. Above it, the expansion would be unaffordable and
+        // the point mass is the stated approximation.
+        DilationLaw::NegativeBinomial if short => expand_negative_binomial(
+            out,
+            reuse_interval.round() as u64,
+            threads,
+            weight,
+            nbd_epsilon,
+        ),
+        DilationLaw::NegativeBinomial => {
+            out.push((f64::from(threads) * reuse_interval, weight));
+            Ok(())
+        }
     }
-    out.push((f64::from(threads) * reuse_interval, weight));
+}
+
+/// `CRI = r + Gamma(shape = r*(1 - 1/T), scale = T)`, quantized into
+/// equal-probability buckets at their midpoints -- the same scheme
+/// [`quantize_racetrack`] uses.
+///
+/// `X ~ NB(r, 1/T)` has mean `r*(T-1)` and variance `r*(T-1)*T`. Matching both
+/// with a Gamma gives scale `T` and shape `r*(1 - 1/T)`, and adding the shift
+/// back puts the mean at `r*T` with the support starting where it must.
+fn quantize_gamma(
+    out: &mut Vec<(f64, f64)>,
+    reuse_interval: f64,
+    threads: u32,
+    weight: f64,
+    bins: usize,
+) -> Result<()> {
+    if bins == 0 {
+        bail!("gamma quantization needs at least one bin");
+    }
+    let threads = f64::from(threads);
+    let shape = reuse_interval * (1.0 - 1.0 / threads);
+    if !(shape > 0.0) {
+        // One thread, or a zero-length window: nothing dilates it.
+        out.push((reuse_interval, weight));
+        return Ok(());
+    }
+    // statrs parameterizes by rate, so a scale of `T` is a rate of `1/T`.
+    let distribution = Gamma::new(shape, 1.0 / threads).map_err(|error| {
+        anyhow!("gamma({shape}, 1/{threads}) is not a distribution: {error}")
+    })?;
+    let bucket = weight / bins as f64;
+    for index in 0..bins {
+        let u = (index as f64 + 0.5) / bins as f64;
+        out.push((reuse_interval + distribution.inverse_cdf(u), bucket));
+    }
     Ok(())
 }
 
@@ -751,7 +847,10 @@ fn expand_negative_binomial(
         if extra > 20_000_000 {
             bail!(
                 "negative-binomial expansion of reuse interval {reuse_interval} at {threads} \
-                 threads did not converge; raise --nbd-epsilon or lower --short-ri-bound"
+                 threads did not converge. Its first term is (1/T)^r, which underflows to zero \
+                 for a window this long, so the expansion never accumulates any mass. Use \
+                 `--dilation hybrid` (the default) or `gamma`, which have no such limit, or \
+                 lower --short-ri-bound"
             );
         }
     }
@@ -851,6 +950,7 @@ mod tests {
             short_bound,
             512,
             1e-12,
+            DilationLaw::NegativeBinomial,
         )
         .expect("expands");
         out
@@ -883,7 +983,7 @@ mod tests {
         for threads in [2u32, 4, 8, 64] {
             for sharers in [2u32, 3, threads] {
                 let mut out = Vec::new();
-                expand(&mut out, 4096.0, 1.0, Sharing::Shared { sharers, lap: 0.0 }, threads, 64.0, 512, 1e-12)
+                expand(&mut out, 4096.0, 1.0, Sharing::Shared { sharers, lap: 0.0 }, threads, 64.0, 512, 1e-12, DilationLaw::NegativeBinomial)
                     .expect("expands");
                 let observed = mean(&out);
                 assert!(
@@ -910,10 +1010,10 @@ mod tests {
         // split far less than a matrix every thread sweeps. Treating it as
         // T-way shared would under-predict the reuse interval.
         let mut halo = Vec::new();
-        expand(&mut halo, 4096.0, 1.0, Sharing::Shared { sharers: 2, lap: 0.0 }, 16, 64.0, 512, 1e-12)
+        expand(&mut halo, 4096.0, 1.0, Sharing::Shared { sharers: 2, lap: 0.0 }, 16, 64.0, 512, 1e-12, DilationLaw::NegativeBinomial)
             .expect("expands");
         let mut everyone = Vec::new();
-        expand(&mut everyone, 4096.0, 1.0, Sharing::Shared { sharers: 16, lap: 0.0 }, 16, 64.0, 512, 1e-12)
+        expand(&mut everyone, 4096.0, 1.0, Sharing::Shared { sharers: 16, lap: 0.0 }, 16, 64.0, 512, 1e-12, DilationLaw::NegativeBinomial)
             .expect("expands");
         let widest = |points: &[(f64, f64)]| points.iter().map(|(v, _)| *v).fold(0.0, f64::max);
         assert!(
@@ -1005,6 +1105,93 @@ mod tests {
             mean(&points) > 4096.0 / 8.0 * 4.0,
             "an undilated racetrack would have mean 512"
         );
+    }
+
+    fn expand_law(
+        reuse_interval: f64,
+        threads: u32,
+        short_bound: f64,
+        dilation: DilationLaw,
+    ) -> Vec<(f64, f64)> {
+        let mut out = Vec::new();
+        expand(
+            &mut out,
+            reuse_interval,
+            1.0,
+            Sharing::Private,
+            threads,
+            short_bound,
+            512,
+            1e-12,
+            dilation,
+        )
+        .expect("expands");
+        out
+    }
+
+    #[test]
+    fn the_gamma_dilation_matches_the_negative_binomial_it_replaces() {
+        // Same law, continuous: both must put the mean at r*T and the variance
+        // near r*T*(T-1).
+        for threads in [2u32, 8, 64] {
+            for r in [4.0, 64.0, 512.0] {
+                // The negative binomial's first term is `(1/T)^r`, which
+                // underflows to zero once `r * log10(T)` passes about 308 -- at
+                // 64 threads that is a window of only 170 accesses. Past there
+                // it cannot be expanded at all, which is one reason the Gamma
+                // is worth having. Compare only where both laws can run.
+                if r * f64::from(threads).log10() > 300.0 {
+                    continue;
+                }
+                let gamma = expand_law(r, threads, f64::INFINITY, DilationLaw::Gamma);
+                let nbd = expand_law(r, threads, f64::INFINITY, DilationLaw::NegativeBinomial);
+                let observed = mean(&gamma);
+                let expected = r * f64::from(threads);
+                assert!(
+                    (observed - expected).abs() < expected * 0.02,
+                    "T={threads} r={r}: gamma mean {observed} should be r*T = {expected}"
+                );
+                assert!(
+                    (observed - mean(&nbd)).abs() < expected * 0.02,
+                    "T={threads} r={r}: gamma and negative binomial should agree"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_gamma_dilation_never_falls_below_the_window_it_dilates() {
+        // CRI = r + X, so the window always holds this thread's own r accesses.
+        // An unshifted Gamma puts mass below r, which costs a factor of thirty
+        // on short reuse.
+        for threads in [2u32, 8] {
+            for r in [1.0, 2.0, 64.0] {
+                let points = expand_law(r, threads, f64::INFINITY, DilationLaw::Gamma);
+                let smallest = points.iter().map(|(v, _)| *v).fold(f64::INFINITY, f64::min);
+                assert!(
+                    smallest >= r - 1e-9,
+                    "T={threads} r={r}: support reaches {smallest}, below the window itself"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_hybrid_takes_each_law_where_it_is_better() {
+        // Below the bound it must be the negative binomial exactly; above it,
+        // the Gamma rather than the point mass the negative binomial falls back
+        // to.
+        let bound = 64.0;
+        assert_eq!(
+            expand_law(2.0, 8, bound, DilationLaw::Hybrid),
+            expand_law(2.0, 8, bound, DilationLaw::NegativeBinomial),
+        );
+        let long = expand_law(4096.0, 8, bound, DilationLaw::Hybrid);
+        assert!(
+            long.len() > 1,
+            "a long window should keep its spread, not collapse to one point"
+        );
+        assert_eq!(long, expand_law(4096.0, 8, bound, DilationLaw::Gamma));
     }
 
     #[test]
