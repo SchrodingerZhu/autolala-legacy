@@ -444,7 +444,16 @@ pub fn analyze<'ctx>(
         )?;
     }
 
-    for (reuse_interval, portion) in distribution_of(shared_reuse, total)? {
+    let shared_distribution = distribution_of(shared_reuse, total)?;
+    // One traversal of the shared data, in accesses: the longest reuse interval
+    // any shared datum shows. A datum touched once per sweep has exactly this
+    // interval, so it is the natural yardstick for whether a shorter window can
+    // expect a sharer to arrive.
+    let lap = shared_distribution
+        .iter()
+        .map(|(reuse_interval, _)| *reuse_interval)
+        .fold(0.0f64, f64::max);
+    for (reuse_interval, portion) in shared_distribution {
         shared_portion += portion;
         reuse_interval_distribution.push((reuse_interval, portion, true));
         if degree_mass <= 0.0 {
@@ -456,6 +465,7 @@ pub fn analyze<'ctx>(
                 portion,
                 Sharing::Shared {
                     sharers: spec.threads,
+                    lap,
                 },
                 spec.threads,
                 knobs.short_bound,
@@ -472,7 +482,7 @@ pub fn analyze<'ctx>(
                 &mut expansion,
                 reuse_interval,
                 portion * degree_weight / degree_mass,
-                Sharing::Shared { sharers },
+                Sharing::Shared { sharers, lap },
                 spec.threads,
                 knobs.short_bound,
                 knobs.racetrack_bins,
@@ -530,13 +540,23 @@ pub fn rescale(path: &std::path::Path, threads: u32, knobs: &CriKnobs) -> Result
         );
     }
 
+    let lap = source
+        .reuse_interval_distribution
+        .iter()
+        .filter(|(_, _, is_shared)| *is_shared)
+        .map(|(reuse_interval, _, _)| *reuse_interval)
+        .fold(0.0f64, f64::max);
+
     let mut expansion = Vec::new();
     let mut private_portion = 0.0;
     let mut shared_portion = 0.0;
     for (reuse_interval, portion, is_shared) in source.reuse_interval_distribution.iter().copied() {
         let sharing = if is_shared {
             shared_portion += portion;
-            Sharing::Shared { sharers: threads }
+            Sharing::Shared {
+                sharers: threads,
+                lap,
+            }
         } else {
             private_portion += portion;
             Sharing::Private
@@ -606,11 +626,12 @@ fn distribution_of<'ctx>(
 }
 
 /// Which Table-1 row a reuse belongs to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Sharing {
     /// The datum is touched by exactly one thread.
     Private,
-    /// The datum is touched by `sharers` distinct threads.
+    /// The datum is touched by `sharers` distinct threads, which between them
+    /// traverse the shared data once every `lap` accesses.
     ///
     /// The paper writes the racetrack with `T` runners, because in the kernels
     /// it targets a shared array is swept by *every* thread. That is not
@@ -619,7 +640,7 @@ pub enum Sharing {
     /// threads run. Carrying the measured degree separately from the thread
     /// count keeps the two effects apart -- the window still dilates by `T`,
     /// but it is split by `sharers - 1` competitors, not `T - 1`.
-    Shared { sharers: u32 },
+    Shared { sharers: u32, lap: f64 },
 }
 
 /// Expands one reuse interval into the concurrent intervals it becomes,
@@ -652,8 +673,43 @@ pub fn expand(
         return Ok(());
     }
 
-    // Short reuse, either row: the CRI distribution has not concentrated yet,
-    // so the negative binomial spread matters more than the sharing.
+    // Two effects act on every reuse window, and which dominates decides the
+    // law. *Dilation*: the other threads' accesses to anything at all stretch
+    // the window by about `T`. *Interception*: another thread touching this
+    // same datum cuts the window short. Dilation always applies; interception
+    // only when a sharer actually reaches the datum before the window closes.
+    //
+    // The racetrack is the interception law and already carries the dilation
+    // inside it. So it is right exactly when interception is likely, and that
+    // is not the same question as the paper's short/long split -- which is a
+    // statement about when a *private* CRI has concentrated on its mean
+    // (Theorem 3.1), and says nothing about whether a sharer arrives.
+    //
+    // Interception is likely when the window, spread across the `s` sharers,
+    // covers a full traversal of the shared data: `r * s >= lap`. Both ways of
+    // getting this wrong were measured. Racetracking a sub-traversal reuse --
+    // two back-to-back accesses to one cache block -- charges it an
+    // interception that never happens. Dilating a full-traversal reuse because
+    // it happens to fall under the Chernoff bound costs 0.44 mean miss-ratio
+    // error on a kernel whose shared array is small enough to sweep in fewer
+    // accesses than the bound.
+    let intercepted = match sharing {
+        Sharing::Shared { sharers, lap } => {
+            sharers >= 2 && reuse_interval * f64::from(sharers) >= lap
+        }
+        Sharing::Private => false,
+    };
+
+    if intercepted {
+        let Sharing::Shared { sharers, .. } = sharing else {
+            unreachable!("interception is only decided for shared data");
+        };
+        return quantize_racetrack(out, reuse_interval, sharers, weight, racetrack_bins);
+    }
+
+    // Not intercepted: the window only dilates. Theorem 3.1 says the dilated
+    // CRI concentrates on `T*r` once the window is long enough; below the
+    // bound it has not, and the negative binomial carries the spread.
     if reuse_interval <= short_bound {
         return expand_negative_binomial(
             out,
@@ -663,26 +719,8 @@ pub fn expand(
             nbd_epsilon,
         );
     }
-
-    match sharing {
-        // Long and private: every one of the other T-1 threads runs an equal
-        // number of accesses inside the window, so it dilates by exactly T.
-        Sharing::Private => {
-            out.push((f64::from(threads) * reuse_interval, weight));
-            Ok(())
-        }
-        // Long and shared: the window is cut short by whichever sharing thread
-        // reaches the datum first.
-        Sharing::Shared { sharers } if sharers >= 2 => {
-            quantize_racetrack(out, reuse_interval, sharers, weight, racetrack_bins)
-        }
-        // A datum only this thread touches cannot be split, whatever the
-        // classifier said.
-        Sharing::Shared { .. } => {
-            out.push((f64::from(threads) * reuse_interval, weight));
-            Ok(())
-        }
-    }
+    out.push((f64::from(threads) * reuse_interval, weight));
+    Ok(())
 }
 
 /// `CRI = r + X` with `X ~ NB(r, 1/T)`: the number of other threads' accesses
@@ -788,8 +826,13 @@ pub fn to_denning_support(mut expansion: Vec<(f64, f64)>) -> Vec<(isize, f64)> {
 mod tests {
     use super::*;
 
+    /// A shared datum touched once per traversal, so every reuse of it is
+    /// intercepted.
     fn shared(threads: u32) -> Sharing {
-        Sharing::Shared { sharers: threads }
+        Sharing::Shared {
+            sharers: threads,
+            lap: 0.0,
+        }
     }
 
     fn expand_one(
@@ -840,7 +883,7 @@ mod tests {
         for threads in [2u32, 4, 8, 64] {
             for sharers in [2u32, 3, threads] {
                 let mut out = Vec::new();
-                expand(&mut out, 4096.0, 1.0, Sharing::Shared { sharers }, threads, 64.0, 512, 1e-12)
+                expand(&mut out, 4096.0, 1.0, Sharing::Shared { sharers, lap: 0.0 }, threads, 64.0, 512, 1e-12)
                     .expect("expands");
                 let observed = mean(&out);
                 assert!(
@@ -867,10 +910,10 @@ mod tests {
         // split far less than a matrix every thread sweeps. Treating it as
         // T-way shared would under-predict the reuse interval.
         let mut halo = Vec::new();
-        expand(&mut halo, 4096.0, 1.0, Sharing::Shared { sharers: 2 }, 16, 64.0, 512, 1e-12)
+        expand(&mut halo, 4096.0, 1.0, Sharing::Shared { sharers: 2, lap: 0.0 }, 16, 64.0, 512, 1e-12)
             .expect("expands");
         let mut everyone = Vec::new();
-        expand(&mut everyone, 4096.0, 1.0, Sharing::Shared { sharers: 16 }, 16, 64.0, 512, 1e-12)
+        expand(&mut everyone, 4096.0, 1.0, Sharing::Shared { sharers: 16, lap: 0.0 }, 16, 64.0, 512, 1e-12)
             .expect("expands");
         let widest = |points: &[(f64, f64)]| points.iter().map(|(v, _)| *v).fold(0.0, f64::max);
         assert!(
@@ -880,17 +923,56 @@ mod tests {
     }
 
     #[test]
-    fn short_reuse_uses_the_negative_binomial_whether_shared_or_not() {
+    fn short_private_reuse_uses_the_negative_binomial() {
         for threads in [2u32, 4, 8] {
-            for sharing in [Sharing::Private, shared(threads)] {
-                let points = expand_one(2.0, sharing, threads, 64.0);
-                let observed = mean(&points);
-                let expected = 2.0 * f64::from(threads);
-                assert!(
-                    (observed - expected).abs() < expected * 0.01,
-                    "{sharing:?} T={threads}: mean {observed} should be r*T = {expected}"
-                );
-            }
+            let points = expand_one(2.0, Sharing::Private, threads, 64.0);
+            let observed = mean(&points);
+            let expected = 2.0 * f64::from(threads);
+            assert!(
+                (observed - expected).abs() < expected * 0.01,
+                "T={threads}: mean {observed} should be r*T = {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_short_shared_reuse_that_covers_a_traversal_is_intercepted() {
+        // Small shared arrays sweep in fewer accesses than the Chernoff bound,
+        // so the paper's short/long split would dilate a reuse that is in fact
+        // certain to be intercepted. Measured, that costs 0.44 mean miss-ratio
+        // error against 0.0024 for the racetrack.
+        for threads in [2u32, 4, 8] {
+            let sharing = Sharing::Shared {
+                sharers: threads,
+                lap: 64.0,
+            };
+            let points = expand_one(64.0, sharing, threads, 77.7);
+            let observed = mean(&points);
+            assert!(
+                (observed - 64.0).abs() < 64.0 * 0.05,
+                "T={threads}: mean {observed} should stay at r = 64, not r*T"
+            );
+        }
+    }
+
+    #[test]
+    fn a_sub_traversal_shared_reuse_only_dilates() {
+        // Two back-to-back accesses to one cache block. The datum is shared, but
+        // no other thread will reach it inside a window of one access, so the
+        // window dilates rather than being cut short. Charging it an
+        // interception was measurably worse across the validation matrix.
+        for threads in [2u32, 4, 8] {
+            let sharing = Sharing::Shared {
+                sharers: threads,
+                lap: 4096.0,
+            };
+            let points = expand_one(1.0, sharing, threads, 77.7);
+            let observed = mean(&points);
+            let expected = f64::from(threads);
+            assert!(
+                (observed - expected).abs() < expected * 0.05,
+                "T={threads}: mean {observed} should dilate to r*T = {expected}"
+            );
         }
     }
 
