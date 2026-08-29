@@ -1,5 +1,5 @@
 module 
-   attributes { "simulation.prologue" = "volatile double ARRAY_0[400][400]; volatile double ARRAY_1[400]; volatile double ARRAY_2[400]; volatile double ARRAY_3[400]; volatile double ARRAY_4[400]; volatile double ARRAY_5[400]; volatile double ARRAY_6[400]; volatile double ARRAY_7[400]; volatile double ARRAY_8[400];" } {
+   attributes { "simulation.dims" = "ARRAY_0:400x400;ARRAY_1:400;ARRAY_2:400;ARRAY_3:400;ARRAY_4:400;ARRAY_5:400;ARRAY_6:400;ARRAY_7:400;ARRAY_8:400" } {
   func.func @kernel_gemver(%A: memref<400x400xf64>,
                            %u1: memref<400xf64>, %v1: memref<400xf64>,
                            %u2: memref<400xf64>, %v2: memref<400xf64>,

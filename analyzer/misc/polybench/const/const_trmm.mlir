@@ -1,4 +1,4 @@
-module attributes {"simulation.prologue" = "volatile double ARRAY_0 [200][240]; volatile double ARRAY_1[200][200];"}
+module attributes {"simulation.dims" = "ARRAY_0:200x240;ARRAY_1:200x200"}
 {
     func.func @kernel_trmm(%A: memref<200x200xf64>, %B: memref<200x240xf64>) {
             %alpha = arith.constant 1.0 : f64

@@ -1,5 +1,5 @@
 // 810s
-module attributes { "simulation.prologue" = "volatile double ARRAY_0[257][257][257], ARRAY_1[257][257][257], ARRAY_2[257][257], ARRAY_3[257], ARRAY_4[257], ARRAY_5[257][257][257], ARRAY_6[257][257], ARRAY_7[257], ARRAY_8[257], ARRAY_9[257][257][257], ARRAY_10[257], ARRAY_11[257], ARRAY_12[257][257], ARRAY_13[257][257];" } {
+module attributes { "simulation.dims" = "ARRAY_0:257x257x257;ARRAY_1:257x257x257;ARRAY_2:257x257;ARRAY_3:257;ARRAY_4:257;ARRAY_5:257x257x257;ARRAY_6:257x257;ARRAY_7:257;ARRAY_8:257;ARRAY_9:257x257x257;ARRAY_10:257;ARRAY_11:257;ARRAY_12:257x257;ARRAY_13:257x257" } {
   func.func @kernel_fdtd_apml(
       %mui: f32, %ch: f32,
       %Ax: memref<?x?xf32>, %Ry: memref<?x?xf32>,

@@ -1,4 +1,4 @@
-module attributes { "simulation.prologue" = " volatile double ARRAY_0[390]; volatile double ARRAY_1[390][410]; volatile double ARRAY_2[410]; volatile double ARRAY_3[410];  " } {
+module attributes { "simulation.dims" = "ARRAY_0:390;ARRAY_1:390x410;ARRAY_2:410;ARRAY_3:410" } {
   func.func @kernel_atax(%A: memref<?x?xf64>, %x: memref<?xf64>, %y: memref<?xf64>, %tmp: memref<?xf64>) {
    affine.for %loop_once = 0 to 1 {
       %c0 = arith.constant 0.0 : f64

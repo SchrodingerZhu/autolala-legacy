@@ -1,4 +1,4 @@
-module attributes { "simulation.prologue" = "volatile double ARRAY_0[400][400];" }{
+module attributes { "simulation.dims" = "ARRAY_0:400x400" }{
     func.func @cholesky(%A: memref<400x400xf64>) {
         affine.for %i = 0 to 400 {
             // j < i case

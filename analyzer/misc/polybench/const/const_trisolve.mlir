@@ -1,4 +1,4 @@
-module attributes {"simulation.prologue" = "volatile double ARRAY_0[640]; volatile double ARRAY_1[640]; volatile double ARRAY_2[640][640];" }
+module attributes {"simulation.dims" = "ARRAY_0:640;ARRAY_1:640;ARRAY_2:640x640" }
  {
     func.func @kernel_trisolv(%L: memref<400x400xf64>, %x: memref<400xf64>, %b: memref<400xf64>) {
         

@@ -1,5 +1,5 @@
 module
-attributes { "simulation.prologue" = "volatile double ARRAY_0[240]; volatile double ARRAY_1[62400]; volatile double ARRAY_2[240]; volatile double ARRAY_3[57600];" }
+attributes { "simulation.dims" = "ARRAY_0:240;ARRAY_1:62400;ARRAY_2:240;ARRAY_3:57600" }
 {
   func.func @kernel_correlation(
       %data   : memref<62400xf64>,   // 260 × 240

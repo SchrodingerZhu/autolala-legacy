@@ -1,4 +1,4 @@
-module attributes { "simulation.prologue" = "volatile double ARRAY_0[400][400]; "} 
+module attributes { "simulation.dims" = "ARRAY_0:400x400"} 
 {
     func.func @kernel_seidel_2d(%A: memref<400x400xf64>) {
         %c1 = arith.constant 1 : index

@@ -1,4 +1,4 @@
-module attributes { "simulation.prologue" = "volatile double ARRAY_0[64]; volatile double ARRAY_1[64][64][64]; volatile double ARRAY_2[64][64];" } {
+module attributes { "simulation.dims" = "ARRAY_0:64;ARRAY_1:64x64x64;ARRAY_2:64x64" } {
   func.func @doitgen(%A: memref<50x40x60xf64>, %C4: memref<60x60xf64>, %sum: memref<60xf64>) {
     // Loop over r
     affine.for %r = 0 to 64 {

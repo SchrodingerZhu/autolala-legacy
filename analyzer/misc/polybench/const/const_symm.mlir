@@ -1,5 +1,5 @@
 module attributes {
-  "simulation.prologue" = "volatile double ARRAY_0[200][240]; volatile double ARRAY_1[200][240]; volatile double ARRAY_2[200][240];"
+  "simulation.dims" = "ARRAY_0:200x240;ARRAY_1:200x240;ARRAY_2:200x240"
 } {
   func.func @kernel_symm(%C: memref<200x240xf64>, %A: memref<200x200xf64>, %B: memref<200x240xf64>) {
     %c0 = arith.constant 0.0 : f64

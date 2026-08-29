@@ -1,4 +1,4 @@
-module attributes { "simulation.prologue" = "volatile double ARRAY_0[512][512]; volatile double ARRAY_1[512][512]; volatile double ARRAY_2[512][512];" } {
+module attributes { "simulation.dims" = "ARRAY_0:512x512;ARRAY_1:512x512;ARRAY_2:512x512" } {
   func.func @matmul(%arg0: memref<?x?xf32>, %arg1: memref<?x?xf32>, %arg2: memref<?x?xf32>) {
     affine.for %arg6 = 0 to 512 {
       affine.for %arg7 = 0 to 512 {

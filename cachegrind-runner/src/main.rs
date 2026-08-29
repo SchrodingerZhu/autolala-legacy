@@ -68,13 +68,15 @@ impl CoolDown {
 struct CProgramEmitter<W: Write> {
     writer: BufWriter<W>,
     indent: usize,
+    hashed: bool,
 }
 
 impl<W: Write> CProgramEmitter<W> {
-    fn new(writer: W) -> Self {
+    fn new(writer: W, hashed: bool) -> Self {
         CProgramEmitter {
             writer: BufWriter::new(writer),
             indent: 1,
+            hashed,
         }
     }
 
@@ -247,11 +249,23 @@ impl<W: Write> CProgramEmitter<W> {
     }
 
     fn emit_access(&mut self, array: ValID, operands: &[ValID], map: AffineMap) -> Result<()> {
-        match array {
-            ValID::Memref(id) => write!(self.writer, "{{ ARRAY_{id}[")?,
-            ValID::Global(id) => write!(self.writer, "{{ {id}[")?,
-            _ => return Err(anyhow!("expected memref/global in access, found: {array}")),
+        let name = array_c_name(array)
+            .ok_or_else(|| anyhow!("expected memref/global in access, found: {array}"))?;
+        if self.hashed {
+            // Route the store through the block permutation: the array itself
+            // is only used as a constant-folded address calculator.
+            write!(
+                self.writer,
+                "{{ __access(__OFF_{name} + (unsigned long)((const volatile char *)&{name}["
+            )?;
+            self.emit_affine_map(&map, operands)?;
+            write!(
+                self.writer,
+                r#"] - (const volatile char *)&{name})); __asm__ __volatile__ ("" ::: "memory"); }}"#
+            )?;
+            return Ok(());
         }
+        write!(self.writer, "{{ {name}[")?;
         self.emit_affine_map(&map, operands)?;
         write!(
             self.writer,
@@ -375,6 +389,11 @@ struct Cli {
     #[arg(long)]
     batched: bool,
 
+    /// Permute block addresses in the emitted program so cachegrind observes
+    /// a uniform (hashed) set mapping instead of the biased modulo mapping
+    #[arg(long)]
+    hash: bool,
+
     /// Database file to store the results
     #[arg(long, short = 'd', default_value = "/tmp/cachegrind.db")]
     database: PathBuf,
@@ -393,6 +412,7 @@ struct Record {
     ll_miss_count: usize,
     total_access: usize,
     process_time: usize,
+    hashed: bool,
 }
 
 fn extract_target<'ctx>(
@@ -472,9 +492,10 @@ impl Record {
                     d1_miss_count,
                     ll_miss_count,
                     total_access,
-                    process_time
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(program, d1_block_size, d1_associativity, d1_cache_size, ll_block_size, ll_associativity, ll_cache_size) DO UPDATE SET
+                    process_time,
+                    hashed
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(program, d1_block_size, d1_associativity, d1_cache_size, ll_block_size, ll_associativity, ll_cache_size, hashed) DO UPDATE SET
                     d1_miss_count = excluded.d1_miss_count,
                     ll_miss_count = excluded.ll_miss_count,
                     total_access = excluded.total_access,
@@ -491,6 +512,7 @@ impl Record {
                     self.ll_miss_count,
                     self.total_access,
                     self.process_time,
+                    self.hashed,
                 ],
             )
             .is_err()
@@ -515,6 +537,128 @@ fn pool_get_retry(
 struct GlobalArrayDeclaration {
     name: String,
     size: Box<[usize]>,
+}
+
+fn array_c_name(array: ValID) -> Option<String> {
+    match array {
+        ValID::Memref(id) => Some(format!("ARRAY_{id}")),
+        ValID::Global(name) => Some(name.to_string()),
+        _ => None,
+    }
+}
+
+fn collect_accessed_arrays(tree: &Tree, out: &mut Vec<String>) {
+    match tree {
+        Tree::For { body, .. } => collect_accessed_arrays(body, out),
+        Tree::Block(children) => {
+            for child in children.iter() {
+                collect_accessed_arrays(child, out);
+            }
+        }
+        Tree::If { then, r#else, .. } => {
+            collect_accessed_arrays(then, out);
+            if let Some(r#else) = r#else {
+                collect_accessed_arrays(r#else, out);
+            }
+        }
+        Tree::Access { memref, .. } => {
+            if let Some(name) = array_c_name(*memref)
+                && !out.contains(&name)
+            {
+                out.push(name);
+            }
+        }
+    }
+}
+
+/// Parse the module's `simulation.dims` attribute:
+/// `"ARRAY_0:200x220;ARRAY_1:200x240"` — a `;`-separated list of
+/// `NAME:D0xD1x...` entries describing arrays of `double`.
+fn parse_simulation_dims(raw: &str) -> Result<Vec<GlobalArrayDeclaration>> {
+    let mut out = Vec::new();
+    for entry in raw.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+        let (name, dims) = entry.split_once(':').ok_or_else(|| {
+            anyhow!("simulation.dims entry `{entry}` is not of the form NAME:D0xD1x...")
+        })?;
+        let size = dims
+            .split('x')
+            .map(|d| d.trim().parse::<usize>())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| anyhow!("simulation.dims entry `{entry}` has a non-numeric dimension"))?;
+        if size.is_empty() || size.iter().any(|&d| d == 0) {
+            return Err(anyhow!("simulation.dims entry `{entry}` has an empty dimension"));
+        }
+        out.push(GlobalArrayDeclaration {
+            name: name.trim().to_string(),
+            size: size.into_boxed_slice(),
+        });
+    }
+    Ok(out)
+}
+
+/// Emit the `--hash` support code: per-array logical byte offsets, one
+/// block-aligned arena, and a bijective permutation of block numbers so
+/// every power-of-two set count sees a uniform set mapping. Block identity
+/// is preserved exactly (distinct logical blocks map to distinct arena
+/// blocks), so fully-associative behavior is unchanged.
+fn emit_hash_preamble<W: Write>(
+    w: &mut W,
+    declared: &[GlobalArrayDeclaration],
+    accessed: &[String],
+    block_size: usize,
+) -> Result<()> {
+    for name in accessed {
+        if !declared.iter().any(|a| a.name == *name) {
+            return Err(anyhow!(
+                "--hash needs the size of every accessed array, but `{name}` is not declared \
+                 via memref.global, memref.alloc, or the module's `simulation.dims` attribute"
+            ));
+        }
+    }
+    let block = block_size as u64;
+    let log2b = block.trailing_zeros();
+    let mut offsets = Vec::new();
+    let mut next = 0u64;
+    for array in declared {
+        let bytes = array.size.iter().product::<usize>() as u64 * 8;
+        offsets.push((array.name.as_str(), next));
+        next += bytes.div_ceil(block) * block;
+    }
+    let total_blocks = (next >> log2b).max(1);
+    // k-bit domain of the permutation; low bits are the (hashed) set index.
+    let k = total_blocks.next_power_of_two().trailing_zeros();
+    let mask = (1u64 << k) - 1;
+    // `x ^= x >> 0` is the zero map, not a bijection — clamp shifts to >= 1.
+    let s1 = (k / 2).max(1);
+    let s2 = (k / 3).max(1);
+    let arena = (mask + 1) << log2b;
+    writeln!(w, "\n// --hash: uniform set-index permutation over {total_blocks} logical blocks")?;
+    for (name, off) in &offsets {
+        writeln!(w, "static const unsigned long __OFF_{name} = {off}UL;")?;
+    }
+    writeln!(w, "alignas(4096) static volatile unsigned char __ARENA[{arena}UL];")?;
+    // Force-inlined pure register arithmetic: a call would push a return
+    // address and any spill would touch the stack, and cachegrind counts
+    // both as data references. The chain below keeps <= 3 values live.
+    writeln!(
+        w,
+        "static inline __attribute__((always_inline)) unsigned long __perm(unsigned long x) {{"
+    )?;
+    writeln!(w, "\tx ^= x >> {s1}; x = (x * 0x9E3779B97F4A7C15UL) & {mask}UL;")?;
+    writeln!(w, "\tx ^= x >> {s2}; x = (x * 0xBF58476D1CE4E5B9UL) & {mask}UL;")?;
+    writeln!(w, "\tx ^= x >> {s1}; return x;")?;
+    writeln!(w, "}}")?;
+    writeln!(
+        w,
+        "static inline __attribute__((always_inline)) void __access(unsigned long a) {{"
+    )?;
+    writeln!(
+        w,
+        "\t__ARENA[(__perm(a >> {log2b}) << {log2b}) | (a & {offmask}UL)] = 0;",
+        offmask = block - 1
+    )?;
+    writeln!(w, "}}")?;
+    Ok(())
 }
 
 fn extract_global_arrays(module: &Module) -> anyhow::Result<Vec<GlobalArrayDeclaration>> {
@@ -667,7 +811,46 @@ fn main() {
         }
         writeln!(program_file, "];").unwrap();
     }
-    let emitter = CProgramEmitter::new(program_file);
+    if let Ok(attr) = module.as_operation().attribute("simulation.dims") {
+        let string = attr.to_string();
+        let dims_arrays = parse_simulation_dims(string.trim().trim_matches('"')).unwrap();
+        for array in &dims_arrays {
+            // volatile, matching the declarations legacy prologues carried
+            write!(program_file, "volatile double {}[", array.name).unwrap();
+            for (i, dim) in array.size.iter().enumerate() {
+                if i > 0 {
+                    write!(program_file, "][").unwrap();
+                }
+                write!(program_file, "{dim}").unwrap();
+            }
+            writeln!(program_file, "];").unwrap();
+        }
+        global_arrays.extend(dims_arrays);
+    } else {
+        trace!("No simulation.dims found");
+    }
+    if args.hash {
+        assert!(
+            args.d1_block_size == args.ll_block_size,
+            "--hash requires equal D1/LL block sizes (got {} and {})",
+            args.d1_block_size,
+            args.ll_block_size
+        );
+        assert!(
+            args.d1_block_size.is_power_of_two() && args.d1_block_size <= 4096,
+            "--hash requires a power-of-two block size <= 4096"
+        );
+        let mut accessed = Vec::new();
+        collect_accessed_arrays(target_tree, &mut accessed);
+        emit_hash_preamble(
+            &mut program_file,
+            &global_arrays,
+            &accessed,
+            args.d1_block_size,
+        )
+        .unwrap();
+    }
+    let emitter = CProgramEmitter::new(program_file, args.hash);
     emitter.emit(target_tree).unwrap();
     info!("C program emitted:{}", {
         std::fs::read_to_string(&program_path).unwrap()
@@ -682,7 +865,11 @@ fn main() {
             "-nostdlib",
             "-fno-stack-protector",
             "-fno-pic",
-            "-Os",
+            // -Os starves the register allocator once --hash adds the
+            // permutation arithmetic, spilling to the stack — and cachegrind
+            // counts every spill as a data reference. -O2 keeps the access
+            // path stackless.
+            if args.hash { "-O2" } else { "-Os" },
             "-ffreestanding",
         ])
         .current_dir(workdir.path())
@@ -705,11 +892,29 @@ fn main() {
             ll_miss_count INTEGER NOT NULL,
             total_access INTEGER NOT NULL,
             process_time INTEGER NOT NULL,
-            PRIMARY KEY (program, d1_block_size, d1_associativity, d1_cache_size, ll_block_size, ll_associativity, ll_cache_size)
+            hashed INTEGER NOT NULL,
+            PRIMARY KEY (program, d1_block_size, d1_associativity, d1_cache_size, ll_block_size, ll_associativity, ll_cache_size, hashed)
         )"#,
             (),
         )
         .unwrap();
+    // CREATE TABLE IF NOT EXISTS silently keeps an old schema; without this
+    // probe, the insert-retry loop below would spin forever on a database
+    // created before the `hashed` column existed.
+    {
+        let conn = pool.get().unwrap();
+        let mut stmt = conn.prepare("PRAGMA table_info(records)").unwrap();
+        let has_hashed = stmt
+            .query_map((), |row| row.get::<_, String>(1))
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|name| name == "hashed");
+        assert!(
+            has_hashed,
+            "database {} has a pre-`hashed` records table; point --database at a new file",
+            args.database.display()
+        );
+    }
 
     let program = args
         .input
@@ -833,6 +1038,7 @@ fn main() {
                 ll_miss_count,
                 total_access,
                 process_time,
+                hashed: args.hash,
             };
             record.insert(&pool);
         });

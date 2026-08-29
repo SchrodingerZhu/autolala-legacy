@@ -1,4 +1,4 @@
-module attributes {"simulation.prologue" = "volatile double ARRAY_0[240][240]; volatile double ARRAY_1[240][200];"} {
+module attributes {"simulation.dims" = "ARRAY_0:240x240;ARRAY_1:240x200"} {
     func.func @kernel_syrk(%C: memref<240x240xf64>, %A: memref<240x200xf64>) {
         %alpha = arith.constant 1.0 : f64
         %beta = arith.constant 1.0 : f64

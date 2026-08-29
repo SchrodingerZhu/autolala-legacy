@@ -1,5 +1,4 @@
-module attributes { "simulation.prologue" = 
-    "volatile double ARRAY_0[180][190]; volatile double ARRAY_1[180][200]; volatile double ARRAY_2[200][190]; volatile double ARRAY_3[190][210]; volatile double ARRAY_4[190][220]; volatile double ARRAY_5[220][210]; volatile double ARRAY_6[180][210];" } {
+module attributes { "simulation.dims" = "ARRAY_0:180x190;ARRAY_1:180x200;ARRAY_2:200x190;ARRAY_3:190x210;ARRAY_4:190x220;ARRAY_5:220x210;ARRAY_6:180x210" } {
     func.func @kernel_3mm(
         %E: memref<?x?xf64>, 
         %A: memref<?x?xf64>, 

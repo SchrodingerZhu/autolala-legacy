@@ -1,4 +1,4 @@
-module attributes { "simulation.prologue" = "volatile double ARRAY_0[500][500];" } {
+module attributes { "simulation.dims" = "ARRAY_0:500x500" } {
   func.func @kernel_floyd_warshall(%path: memref<500x500xf32>) {
     
     // Triple nested loop: k, i, j all from 0 to 500

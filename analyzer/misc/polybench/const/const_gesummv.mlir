@@ -1,5 +1,5 @@
 module 
- attributes { "simulation.prologue" = "volatile double ARRAY_0[256]; volatile double ARRAY_1[256]; volatile double ARRAY_2[256][256]; volatile double ARRAY_3[256]; volatile double ARRAY_4[256][256];" }
+ attributes { "simulation.dims" = "ARRAY_0:256;ARRAY_1:256;ARRAY_2:256x256;ARRAY_3:256;ARRAY_4:256x256" }
 {
   func.func @kernel_gesummv( %A: memref<256x256xf64>,
                             %B: memref<256x256xf64>,

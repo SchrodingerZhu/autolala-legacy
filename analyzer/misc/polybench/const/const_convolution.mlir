@@ -1,4 +1,4 @@
-module attributes { "simulation.prologue" = "volatile double ARRAY_0[16][16]; volatile double ARRAY_1[512][512]; volatile double ARRAY_2[497][497];" } {
+module attributes { "simulation.dims" = "ARRAY_0:16x16;ARRAY_1:512x512;ARRAY_2:497x497" } {
   func.func @conv2d_kernel(%input: memref<512x512xf64>, %filter: memref<16x16xf64>, %output: memref<497x497xf64>) {
     // Loop over the output matrix dimensions (497x497)
     affine.for %i = 0 to 497 {

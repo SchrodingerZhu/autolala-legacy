@@ -1,4 +1,4 @@
-module attributes { "simulation.prologue" = "volatile double ARRAY_0[200][240]; volatile double ARRAY_1[240][240]; volatile double ARRAY_2[200][240];" } {
+module attributes { "simulation.dims" = "ARRAY_0:200x240;ARRAY_1:240x240;ARRAY_2:200x240" } {
   func.func @gramschmidt(%A: memref<?x?xf64>,
                          %R: memref<?x?xf64>,
                          %Q: memref<?x?xf64>) {

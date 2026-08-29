@@ -1,4 +1,4 @@
-module attributes { "simulation.prologue" = "volatile double ARRAY_0[200][220]; volatile double ARRAY_1[200][240]; volatile double ARRAY_2[240][220];" }{
+module attributes { "simulation.dims" = "ARRAY_0:200x220;ARRAY_1:200x240;ARRAY_2:240x220" }{
   func.func @kernel_gemm(%C: memref<200x220xf32>, 
                          %A: memref<200x240xf32>, 
                          %B: memref<240x220xf32>) {

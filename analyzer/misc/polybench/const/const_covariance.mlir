@@ -1,7 +1,6 @@
 module 
   attributes {
-    "simulation.prologue" =
-      "volatile double ARRAY_0[256];volatile double ARRAY_1[65536];volatile double ARRAY_2[65536];"
+    "simulation.dims" = "ARRAY_0:256;ARRAY_1:65536;ARRAY_2:65536"
   }
 {
   func.func @kernel_covariance(

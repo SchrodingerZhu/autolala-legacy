@@ -1,4 +1,4 @@
-module attributes { "simulation.prologue" = "volatile double ARRAY_0[390]; volatile double ARRAY_1[390];  volatile double ARRAY_2[410]; volatile double ARRAY_3[410][390]; volatile double ARRAY_4[410];" } {
+module attributes { "simulation.dims" = "ARRAY_0:390;ARRAY_1:390;ARRAY_2:410;ARRAY_3:410x390;ARRAY_4:410" } {
     // Constants
     // Function definition
     func.func @bicg(%argA: memref<410x390xf64>, %argS: memref<390xf64>, %argR: memref<410xf64>, %argQ: memref<390xf64>, %argP: memref<410xf64>) {

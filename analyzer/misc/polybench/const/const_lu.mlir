@@ -1,4 +1,4 @@
-module attributes { "simulation.prologue" = "volatile double ARRAY_0[400][400];" } {
+module attributes { "simulation.dims" = "ARRAY_0:400x400" } {
   func.func @lu_decomposition(%A: memref<?x?xf32>) {
     // Iterate over columns (k-th column of A)
     affine.for %k = 0 to 400 {

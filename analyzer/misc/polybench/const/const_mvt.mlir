@@ -1,5 +1,5 @@
 module 
-attributes { "simulation.prologue" = "volatile double ARRAY_0[400]; volatile double ARRAY_1[400][400]; volatile double ARRAY_2[400]; double volatile ARRAY_3[400]; double volatile ARRAY_4[400];" }
+attributes { "simulation.dims" = "ARRAY_0:400;ARRAY_1:400x400;ARRAY_2:400;ARRAY_3:400;ARRAY_4:400" }
 {
   func.func @kernel_mvt(%x1: memref<400xf64>, %x2: memref<400xf64>, 
                         %y_1: memref<400xf64>, %y_2: memref<400xf64>, 
