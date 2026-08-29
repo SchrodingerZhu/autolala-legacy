@@ -1,8 +1,0 @@
-
-[[proxy]]
-backend = "http://localhost:8888/analysis" # Address to proxy requests to
-ws = false                                 # Use WebSocket for this proxy
-insecure = false                           # Disable certificate validation
-no_system_proxy = false                    # Disable system proxy
-rewrite = "/analysis"                      # Strip the given prefix off paths
-no_redirect = false                        # Disable following redirects of proxy responses

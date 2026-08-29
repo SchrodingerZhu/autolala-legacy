@@ -4,8 +4,6 @@ members = [
     "raffine",
     "analyzer",
     "denning",
-    "analysis-server",
-    "analysis-webpage",
     "cachegrind-runner",
     "mrc",
     "assoc-conv",
