@@ -66,8 +66,7 @@ for i in {1..6}; do
     cargo run --release --quiet --bin assoc-conv -- \
         -o "${WA_DIR}/${PROGRAM_NAME}.json" \
         -i "${FA_DIR}/${PROGRAM_NAME}.json" \
-        -a 12 \
-        -d constant
+        -a 12
     
     if [ $? -ne 0 ]; then
         echo "Error: 12-way prediction failed for ${PROGRAM_NAME}"

@@ -207,6 +207,7 @@ def main():
     parser.add_argument('-c', '--cache-size', type=int, default=512, help='Cache size in bytes (default: 512)')
     parser.add_argument('-d', '--data-dir', default='/tmp', help='Directory for intermediate files (default: /tmp)')
     parser.add_argument('-o', '--output-dir', help='Output directory for plots (if not provided, plots will not be saved)')
+    parser.add_argument('--hash', action='store_true', help='Run the simulator with hashed (uniform) set mapping')
     
     args = parser.parse_args()
     
@@ -238,7 +239,7 @@ def main():
     
     # Generate file prefix based on input file and arguments
     # Create a hash of the arguments to keep filename manageable
-    arg_string = f"{args.input}_{args.block_size}_{args.element_size}_{args.associativity}_{args.cache_size}"
+    arg_string = f"{args.input}_{args.block_size}_{args.element_size}_{args.associativity}_{args.cache_size}_{args.hash}"
     arg_hash = hashlib.md5(arg_string.encode()).hexdigest()[:8]
     input_basename = os.path.basename(args.input).replace('.', '_')
     file_prefix = f"{input_basename}_{arg_hash}"
@@ -310,6 +311,8 @@ def main():
             "--database", full_db,
             "--batched"
         ]
+        if args.hash:
+            cmd3.append("--hash")
         run_command(cmd3, "🖥️ Running simulation for fully associative cache", 3, 4)
     
     # Step 4: Run simulator for associative cache
@@ -328,6 +331,8 @@ def main():
             "--database", assoc_db,
             "--batched"
         ]
+        if args.hash:
+            cmd4.append("--hash")
         run_command(cmd4, f"🖥️ Running simulation for {args.associativity}-way associative cache", 4, 4)
         
     # Step 5: Generate plots

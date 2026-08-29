@@ -10,5 +10,5 @@ ${POLY_PATH:+$POLY_PATH/}cgeist $1 -S -raise-scf-to-affine | \
 mkdir -p results/fully-associative
 mkdir -p results/12-way
 cargo run --release --quiet --bin analyzer -- -i /tmp/"${PROGRAM_NAME}.mlir" --json -o results/fully-associative/${PROGRAM_NAME}.json barvinok --barvinok-arg=--approximation-method=scale --infinite-repeat --block-size=8
-cargo run --release --quiet --bin assoc-conv -- -o results/12-way/${PROGRAM_NAME}.json -i results/fully-associative/${PROGRAM_NAME}.json -a 12 -d constant
+cargo run --release --quiet --bin assoc-conv -- -o results/12-way/${PROGRAM_NAME}.json -i results/fully-associative/${PROGRAM_NAME}.json -a 12
 

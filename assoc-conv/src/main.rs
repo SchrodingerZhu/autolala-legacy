@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use denning::{MissRatioCurve, SkewDecay};
+use denning::MissRatioCurve;
 use palc::Parser;
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -19,12 +19,6 @@ struct Cli {
     /// Associativity to convert to
     #[arg(short, long)]
     assoc: usize,
-    /// Skewness factor for the conversion model
-    #[arg(short, long, default_value_t = 1.0)]
-    skewness: f64,
-    /// Decay factor for the conversion model
-    #[arg(short, long, default_value = "constant")]
-    decay: SkewDecay,
 }
 
 fn main() {
@@ -35,7 +29,7 @@ fn main() {
     let data = Data {
         miss_ratio_curve: input
             .miss_ratio_curve
-            .compute_assoc(cli.assoc, cli.skewness, cli.decay),
+            .compute_assoc(cli.assoc),
     };
     let output: Box<dyn std::io::Write> = if let Some(output_path) = cli.output {
         let file = std::fs::File::create(output_path).expect("Failed to create output file");
