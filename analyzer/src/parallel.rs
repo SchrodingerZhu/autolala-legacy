@@ -41,6 +41,7 @@ use barvinok::{
 use raffine::tree::Tree;
 use serde::{Deserialize, Serialize};
 use statrs::distribution::{ContinuousCDF, Gamma};
+use statrs::function::beta::beta_reg;
 
 use crate::isl;
 
@@ -327,6 +328,14 @@ pub enum DilationLaw {
     /// short reuse, where the window holds few enough accesses that the
     /// distribution's discreteness still matters.
     Hybrid,
+    /// `CRI = r + X` with `X` the continuous negative binomial, evaluated
+    /// through its beta form: `P[X <= k] = I_{1/T}(r, k+1)`, the regularized
+    /// incomplete beta, continuous in both `r` and `k` and defined for real
+    /// `r`. One law at every window length -- exact NB support and skew where
+    /// the window is short, converging to the shifted Gamma where it is long
+    /// -- with no Theorem 3.1 cutoff, no rounding of `r`, and no point-mass
+    /// collapse. Quantized by equal-probability buckets like the Gamma.
+    Beta,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -752,9 +761,12 @@ pub fn expand(
     // Not intercepted: the window only dilates.
     let short = reuse_interval <= short_bound;
     match dilation {
-        // The continuous form carries the spread at every `r` for a fixed cost,
+        // The continuous forms carry the spread at every `r` for a fixed cost,
         // so there is no cutoff to apply.
         DilationLaw::Gamma => quantize_gamma(out, reuse_interval, threads, weight, racetrack_bins),
+        DilationLaw::Beta => {
+            quantize_continuous_nb(out, reuse_interval, threads, weight, racetrack_bins)
+        }
         DilationLaw::Hybrid if short => expand_negative_binomial(
             out,
             reuse_interval.round() as u64,
@@ -815,6 +827,62 @@ fn quantize_gamma(
     for index in 0..bins {
         let u = (index as f64 + 0.5) / bins as f64;
         out.push((reuse_interval + distribution.inverse_cdf(u), bucket));
+    }
+    Ok(())
+}
+
+/// `CRI = r + X` with `X` the continuous negative binomial `NB(r, 1/T)`,
+/// evaluated through its beta form `P[X <= k] = I_{1/T}(r, k+1)` -- continuous
+/// in both `r` and `k`, defined for real `r`, exact NB support and skew at
+/// every window length, converging to the shifted Gamma for long windows.
+/// Quantized into equal-probability buckets at their midpoints, the same
+/// scheme [`quantize_gamma`] uses; the quantile has no closed-form inverse, so
+/// each bucket bisects the beta CDF in `k`.
+fn quantize_continuous_nb(
+    out: &mut Vec<(f64, f64)>,
+    reuse_interval: f64,
+    threads: u32,
+    weight: f64,
+    bins: usize,
+) -> Result<()> {
+    if bins == 0 {
+        bail!("continuous-NB quantization needs at least one bin");
+    }
+    let t = f64::from(threads);
+    let p = 1.0 / t;
+    let r = reuse_interval;
+    let cdf = |k: f64| beta_reg(r, k + 1.0, p);
+    // NB(r, 1/T) has mean r*(T-1) and variance r*(T-1)*T. Cantelli's
+    // one-sided inequality bounds the u-quantile of ANY such distribution by
+    // mean + sd*sqrt(u/(1-u)); the largest u a bucket midpoint reaches is
+    // (bins-0.5)/bins, so this bracket provably contains every quantile.
+    let (mean, sd) = (r * (t - 1.0), (r * (t - 1.0) * t).sqrt());
+    let u_max = (bins as f64 - 0.5) / bins as f64;
+    let upper = mean + sd * (u_max / (1.0 - u_max)).sqrt();
+    let bucket = weight / bins as f64;
+    // `k` counts other threads' accesses, so the emitted quantile is the
+    // smallest INTEGER with `F(k) >= u`. The interpolant agrees with the
+    // discrete CDF at integers and rises strictly between them, so that is
+    // the ceiling of the continuous solution -- except at the first atom,
+    // where bisection converges to 0+eps and the ceiling would shift the
+    // whole `P[X = 0] = p^r` mass one slot up; guard it explicitly.
+    let mass_at_zero = cdf(0.0);
+    for index in 0..bins {
+        let u = (index as f64 + 0.5) / bins as f64;
+        if mass_at_zero >= u {
+            out.push((reuse_interval, bucket));
+            continue;
+        }
+        let (mut lo, mut hi) = (0.0_f64, upper);
+        while hi - lo > 1e-9 * hi.max(1.0) {
+            let mid = 0.5 * (lo + hi);
+            if cdf(mid) < u {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        out.push((reuse_interval + (0.5 * (lo + hi)).ceil(), bucket));
     }
     Ok(())
 }

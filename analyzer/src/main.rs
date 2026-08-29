@@ -306,7 +306,10 @@ fn parse_dilation(text: &str) -> anyhow::Result<parallel::DilationLaw> {
         "nbd" | "negative-binomial" => Ok(parallel::DilationLaw::NegativeBinomial),
         "gamma" => Ok(parallel::DilationLaw::Gamma),
         "hybrid" => Ok(parallel::DilationLaw::Hybrid),
-        other => Err(anyhow!("unknown dilation law `{other}`; expected nbd, gamma or hybrid")),
+        "beta" => Ok(parallel::DilationLaw::Beta),
+        other => Err(anyhow!(
+            "unknown dilation law `{other}`; expected nbd, gamma, hybrid or beta"
+        )),
     }
 }
 
