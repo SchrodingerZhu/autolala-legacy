@@ -75,8 +75,8 @@ class Row:
     digest: str
 
 
-def run(cmd: list[str]) -> str:
-    result = subprocess.run(cmd, capture_output=True, text=True)
+def run(cmd: list[str], timeout: float | None = None) -> str:
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     if result.returncode != 0:
         raise RuntimeError(
             f"command failed ({result.returncode}): {' '.join(cmd)}\n{result.stderr[-2000:]}"
@@ -84,7 +84,8 @@ def run(cmd: list[str]) -> str:
     return result.stdout
 
 
-def sample(kernel: str, threads: int, chunk: str, block_size: int) -> dict:
+def sample(kernel: str, threads: int, chunk: str, block_size: int,
+           reuse_distance: bool = True, timeout: float | None = None) -> dict:
     cmd = [
         str(PSAMPLE),
         "--input", str(MISC / f"{kernel}.mlir"),
@@ -93,18 +94,27 @@ def sample(kernel: str, threads: int, chunk: str, block_size: int) -> dict:
         "--block-size", str(block_size),
         "--seed", "1",
     ]
+    # Exact reuse distance costs memory proportional to the working set and
+    # feeds only the `exact` curve; callers comparing against measured reuse
+    # *intervals* can skip it.
+    if not reuse_distance:
+        cmd.append("--no-reuse-distance")
     if chunk != "auto":
         cmd += ["--chunk", chunk]
-    return json.loads(run(cmd))
+    return json.loads(run(cmd, timeout=timeout))
 
 
 def model(kernel: str, threads: int, chunk: str, block_size: int,
-          dilation: str = "hybrid") -> dict:
+          dilation: str = "hybrid", timeout: float | None = None) -> dict:
     cmd = [
         str(ANALYZER),
         "--input", str(MISC / f"{kernel}.mlir"),
         "--json",
         "barvinok",
+        # The repository's own prediction scripts run barvinok this way, and on
+        # the larger PolyBench kernels it is the difference between two seconds
+        # and not terminating.
+        "--barvinok-arg=--approximation-method=scale",
         "--parallel-loop-depth", "0",
         "--threads", str(threads),
         "--block-size", str(block_size),
@@ -114,7 +124,7 @@ def model(kernel: str, threads: int, chunk: str, block_size: int,
         cmd += ["--chunk", chunk]
     # The analyzer prints a licence banner on stderr and the JSON document as
     # the final stdout line.
-    return json.loads(run(cmd).strip().splitlines()[-1])
+    return json.loads(run(cmd, timeout=timeout).strip().splitlines()[-1])
 
 
 def model_scaled(base_report: Path, threads: int, chunk: str) -> dict:
@@ -132,7 +142,7 @@ def model_scaled(base_report: Path, threads: int, chunk: str) -> dict:
     ]
     if chunk != "auto":
         cmd += ["--chunk", chunk]
-    return json.loads(run(cmd).strip().splitlines()[-1])
+    return json.loads(run(cmd, timeout=timeout).strip().splitlines()[-1])
 
 
 def step_lookup(turning_points: list[float], miss_ratio: list[float], size: float) -> float:

@@ -1,0 +1,326 @@
+[
+  {
+    "category": "polybench",
+    "kernel": "atax",
+    "threads": 4,
+    "error": 0.12418439321788123
+  },
+  {
+    "category": "polybench",
+    "kernel": "atax",
+    "threads": 8,
+    "error": 0.1661500713763162
+  },
+  {
+    "category": "polybench",
+    "kernel": "bicg",
+    "threads": 4,
+    "error": 0.005183192904793494
+  },
+  {
+    "category": "polybench",
+    "kernel": "bicg",
+    "threads": 8,
+    "error": 0.026639980598283246
+  },
+  {
+    "category": "polybench",
+    "kernel": "convolution",
+    "threads": 4,
+    "error": 0.11616205387633474
+  },
+  {
+    "category": "polybench",
+    "kernel": "convolution",
+    "threads": 8,
+    "error": 0.1731753221129544
+  },
+  {
+    "category": "polybench",
+    "kernel": "doitgen",
+    "threads": 4,
+    "error": 0.010432326623785387
+  },
+  {
+    "category": "polybench",
+    "kernel": "doitgen",
+    "threads": 8,
+    "error": 0.023052706742397823
+  },
+  {
+    "category": "polybench",
+    "kernel": "gemm",
+    "threads": 4,
+    "error": 0.038764720798017946
+  },
+  {
+    "category": "polybench",
+    "kernel": "gemm",
+    "threads": 8,
+    "error": 0.04799744244921953
+  },
+  {
+    "category": "polybench",
+    "kernel": "gesummv",
+    "threads": 4,
+    "error": 0.00420038063386184
+  },
+  {
+    "category": "polybench",
+    "kernel": "gesummv",
+    "threads": 8,
+    "error": 0.01492120800380263
+  },
+  {
+    "category": "polybench",
+    "kernel": "mvt",
+    "threads": 4,
+    "error": 0.07269191542758038
+  },
+  {
+    "category": "polybench",
+    "kernel": "mvt",
+    "threads": 8,
+    "error": 0.1094175358383742
+  },
+  {
+    "category": "polybench",
+    "kernel": "seidel-2d",
+    "threads": 4,
+    "error": 0.03964192172540157
+  },
+  {
+    "category": "polybench",
+    "kernel": "seidel-2d",
+    "threads": 8,
+    "error": 0.059515864440441164
+  },
+  {
+    "category": "polybench",
+    "kernel": "trisolve",
+    "threads": 4,
+    "error": 0.005711060001502963
+  },
+  {
+    "category": "polybench",
+    "kernel": "trisolve",
+    "threads": 8,
+    "error": 0.0013302713241441129
+  },
+  {
+    "category": "einsum",
+    "kernel": "batch_matmul",
+    "threads": 4,
+    "error": 0.00013324499455477057
+  },
+  {
+    "category": "einsum",
+    "kernel": "batch_matmul",
+    "threads": 8,
+    "error": 0.00012512780327526008
+  },
+  {
+    "category": "einsum",
+    "kernel": "bilinear_transformation_pattern",
+    "threads": 4,
+    "error": 0.05803235484535361
+  },
+  {
+    "category": "einsum",
+    "kernel": "bilinear_transformation_pattern",
+    "threads": 8,
+    "error": 0.07076648636500188
+  },
+  {
+    "category": "einsum",
+    "kernel": "hadamard_product_2d",
+    "threads": 4,
+    "error": 0.0
+  },
+  {
+    "category": "einsum",
+    "kernel": "hadamard_product_2d",
+    "threads": 8,
+    "error": 0.0
+  },
+  {
+    "category": "einsum",
+    "kernel": "hadamard_product_4d",
+    "threads": 4,
+    "error": 0.0
+  },
+  {
+    "category": "einsum",
+    "kernel": "hadamard_product_4d",
+    "threads": 8,
+    "error": 0.0
+  },
+  {
+    "category": "einsum",
+    "kernel": "mahalanobis_distance_pattern",
+    "threads": 4,
+    "error": 0.0760721634258246
+  },
+  {
+    "category": "einsum",
+    "kernel": "mahalanobis_distance_pattern",
+    "threads": 8,
+    "error": 0.12041457800895111
+  },
+  {
+    "category": "einsum",
+    "kernel": "matrix_chain_5",
+    "threads": 4,
+    "error": 0.021619908950163476
+  },
+  {
+    "category": "einsum",
+    "kernel": "matrix_chain_5",
+    "threads": 8,
+    "error": 0.03858226248844869
+  },
+  {
+    "category": "einsum",
+    "kernel": "matrix_diagonal",
+    "threads": 4,
+    "error": 0.0
+  },
+  {
+    "category": "einsum",
+    "kernel": "matrix_diagonal",
+    "threads": 8,
+    "error": 0.0
+  },
+  {
+    "category": "einsum",
+    "kernel": "matrix_trace",
+    "threads": 4,
+    "error": 0.0363246249874154
+  },
+  {
+    "category": "einsum",
+    "kernel": "matrix_trace",
+    "threads": 8,
+    "error": 0.048221614227085825
+  },
+  {
+    "category": "einsum",
+    "kernel": "maxcut_quantum_circuit_pattern",
+    "threads": 4,
+    "error": 0.05734259435559837
+  },
+  {
+    "category": "einsum",
+    "kernel": "maxcut_quantum_circuit_pattern",
+    "threads": 8,
+    "error": 0.08475564204661623
+  },
+  {
+    "category": "einsum",
+    "kernel": "tensor_network_2x3_pattern",
+    "threads": 4,
+    "error": 0.09994839042106335
+  },
+  {
+    "category": "einsum",
+    "kernel": "tensor_network_2x3_pattern",
+    "threads": 8,
+    "error": 0.13974777991893958
+  },
+  {
+    "category": "einsum",
+    "kernel": "triplestore_query_pattern",
+    "threads": 4,
+    "error": 0.028534763322249777
+  },
+  {
+    "category": "einsum",
+    "kernel": "triplestore_query_pattern",
+    "threads": 8,
+    "error": 0.051599600149572024
+  },
+  {
+    "category": "einsum",
+    "kernel": "tucker_decomposition_pattern",
+    "threads": 4,
+    "error": 0.054971873195681614
+  },
+  {
+    "category": "einsum",
+    "kernel": "tucker_decomposition_pattern",
+    "threads": 8,
+    "error": 0.08355634657588781
+  },
+  {
+    "category": "einsum",
+    "kernel": "vector_outer_product",
+    "threads": 4,
+    "error": 0.019471484853122938
+  },
+  {
+    "category": "einsum",
+    "kernel": "vector_outer_product",
+    "threads": 8,
+    "error": 0.03714181893687914
+  },
+  {
+    "category": "einsum",
+    "kernel": "weighted_model_counting_pattern",
+    "threads": 4,
+    "error": 0.08739508777660084
+  },
+  {
+    "category": "einsum",
+    "kernel": "weighted_model_counting_pattern",
+    "threads": 8,
+    "error": 0.1389205562285333
+  },
+  {
+    "category": "fusion",
+    "kernel": "einsum_tensor_network_2x3_pattern",
+    "threads": 4,
+    "error": 0.05747716646760658
+  },
+  {
+    "category": "fusion",
+    "kernel": "einsum_tensor_network_2x3_pattern",
+    "threads": 8,
+    "error": 0.08988717393099742
+  },
+  {
+    "category": "fusion",
+    "kernel": "einsum_tucker_decomposition_pattern",
+    "threads": 4,
+    "error": 0.06235965867866878
+  },
+  {
+    "category": "fusion",
+    "kernel": "einsum_tucker_decomposition_pattern",
+    "threads": 8,
+    "error": 0.08708751429063846
+  },
+  {
+    "category": "fusion",
+    "kernel": "einsum_weighted_model_counting_pattern",
+    "threads": 4,
+    "error": 0.08735270879312343
+  },
+  {
+    "category": "fusion",
+    "kernel": "einsum_weighted_model_counting_pattern",
+    "threads": 8,
+    "error": 0.13902492481352166
+  },
+  {
+    "category": "fusion",
+    "kernel": "polybench_doitgen",
+    "threads": 4,
+    "error": 0.009683651367751836
+  },
+  {
+    "category": "fusion",
+    "kernel": "polybench_doitgen",
+    "threads": 8,
+    "error": 0.022252100846529954
+  }
+]
