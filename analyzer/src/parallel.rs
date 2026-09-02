@@ -374,6 +374,12 @@ pub struct ParallelReport {
     pub reuse_interval_distribution: Vec<(f64, f64, bool)>,
     /// `(CRI, portion)` support, ready for `denning::MissRatioCurve::new`.
     pub support: Vec<(isize, f64)>,
+    /// Wall time of the polyhedral part inside this function: the reuse
+    /// relations and their barvinok counts. The lowering that precedes it is
+    /// timed by the caller.
+    pub derivation_seconds: f64,
+    /// Wall time of applying the CRI laws to the derived distribution.
+    pub scaling_seconds: f64,
 }
 
 /// Runs the parallel pipeline over a thread-extended timestamp space.
@@ -389,6 +395,7 @@ pub fn analyze<'ctx>(
     spec: &ParallelSpec,
     knobs: &CriKnobs,
 ) -> Result<ParallelReport> {
+    let derivation_started = std::time::Instant::now();
     let total = space.clone().cardinality()?;
 
     let same_element = access_map
@@ -470,12 +477,19 @@ pub fn analyze<'ctx>(
     let shared_reuse = sequential_reuse.intersect_domain(shared_times)?;
     let unshared_reuse = private_reuse.intersect_domain(private_times)?;
 
+    // Both counts are the last of the polyhedral work; everything after this
+    // point is closed-form arithmetic over the resulting distributions.
+    let private_distribution = distribution_of(unshared_reuse, total.clone())?;
+    let shared_distribution = distribution_of(shared_reuse, total)?;
+    let derivation_seconds = derivation_started.elapsed().as_secs_f64();
+    let scaling_started = std::time::Instant::now();
+
     let mut expansion = Vec::new();
     let mut reuse_interval_distribution = Vec::new();
     let mut shared_portion = 0.0;
     let mut private_portion = 0.0;
 
-    for (reuse_interval, portion) in distribution_of(unshared_reuse, total.clone())? {
+    for (reuse_interval, portion) in private_distribution {
         private_portion += portion;
         reuse_interval_distribution.push((reuse_interval, portion, false));
         expand(
@@ -491,7 +505,6 @@ pub fn analyze<'ctx>(
         )?;
     }
 
-    let shared_distribution = distribution_of(shared_reuse, total)?;
     // One traversal of the shared data, in accesses: the longest reuse interval
     // any shared datum shows. A datum touched once per sweep has exactly this
     // interval, so it is the natural yardstick for whether a shorter window can
@@ -550,6 +563,8 @@ pub fn analyze<'ctx>(
         mean_sharing_degree,
         reuse_interval_distribution,
         support: to_denning_support(expansion),
+        derivation_seconds,
+        scaling_seconds: scaling_started.elapsed().as_secs_f64(),
     })
 }
 
@@ -596,6 +611,7 @@ pub fn rescale(path: &std::path::Path, threads: u32, knobs: &CriKnobs) -> Result
         .map(|(reuse_interval, _, _)| *reuse_interval)
         .fold(0.0f64, f64::max);
 
+    let scaling_started = std::time::Instant::now();
     let mut expansion = Vec::new();
     let mut private_portion = 0.0;
     let mut shared_portion = 0.0;
@@ -638,6 +654,8 @@ pub fn rescale(path: &std::path::Path, threads: u32, knobs: &CriKnobs) -> Result
         },
         reuse_interval_distribution: source.reuse_interval_distribution,
         support: to_denning_support(expansion),
+        derivation_seconds: 0.0,
+        scaling_seconds: scaling_started.elapsed().as_secs_f64(),
     })
 }
 

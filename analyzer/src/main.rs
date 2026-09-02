@@ -412,6 +412,10 @@ fn main_entry() -> anyhow::Result<()> {
             let tree = extract_target(&module, &options, context, &dom)?;
             debug!("Extracted tree: {}", tree);
             let (max_param, _) = utils::get_max_param_ivar(tree)?;
+            // Everything from here to the reuse counts is the symbolic
+            // derivation; it is timed as one phase, split across this
+            // lowering and `parallel::analyze`.
+            let lowering_started = std::time::Instant::now();
             let mut space = isl::get_timestamp_space((max_param + 1).try_into()?, context, tree)?;
             let local_space: LocalSpace = space.get_space()?.try_into()?;
             for (idx, bound) in symbol_lowerbound.iter().enumerate() {
@@ -527,6 +531,7 @@ fn main_entry() -> anyhow::Result<()> {
                     nbd_epsilon: *nbd_epsilon,
                     dilation: parse_dilation(dilation)?,
                 };
+                let lowering_seconds = lowering_started.elapsed().as_secs_f64();
                 let report = parallel::analyze(
                     space.clone(),
                     access_map.clone(),
@@ -534,15 +539,32 @@ fn main_entry() -> anyhow::Result<()> {
                     spec,
                     &knobs,
                 )?;
+                // The lowering above ran before `analyze` started its own
+                // clock, so the derivation phase is the two added together.
+                let derivation_seconds = lowering_seconds + report.derivation_seconds;
+
+                let mrc_started = std::time::Instant::now();
                 let mut curve = denning::MissRatioCurve::new(&report.support);
+                let mrc_seconds = mrc_started.elapsed().as_secs_f64();
+
+                let assoc_started = std::time::Instant::now();
                 if options.associativity.get() > 1 {
                     curve = curve.compute_assoc(options.associativity.get());
                 }
+                let associativity_seconds = assoc_started.elapsed().as_secs_f64();
+
                 if options.json {
                     let output = serde_json::json!({
                         "parallel": &report,
                         "miss_ratio_curve": &curve,
                         "elapsed_seconds": start_time.elapsed().as_secs_f64(),
+                        "timings": {
+                            "derivation": derivation_seconds,
+                            "parallel_scaling": report.scaling_seconds,
+                            "mrc": mrc_seconds,
+                            "associativity": associativity_seconds,
+                            "associativity_ways": options.associativity.get(),
+                        },
                     });
                     writeln!(writer, "{output}")?;
                 } else {

@@ -43,10 +43,25 @@ impl MissRatioCurve {
             }
         }
 
-        let max_tp_usize = rd.last().unwrap().ceil() as usize;
-        let cache_sizes: Vec<_> = (associativity..(max_tp_usize + associativity))
-            .step_by(1)
-            .collect();
+        // Evaluate on a geometric grid of cache sizes, not every integer. The
+        // converted curve is smooth in the cache size, and every consumer
+        // interpolates over the turning points it gets back, so 32 points per
+        // doubling resolves it. Enumerating integers instead is O(largest
+        // turning point) in both memory and time: it is why a 12-way
+        // conversion took twelve seconds single-threaded on gemm, and on a
+        // kernel whose reuse intervals reach 10^16 it asked for 10^17 bytes
+        // and aborted the whole analysis after the derivation had finished.
+        const POINTS_PER_OCTAVE: f64 = 32.0;
+        let max_tp = rd.last().copied().unwrap_or(0.0).max(0.0) + associativity as f64;
+        let lowest = associativity as f64;
+        let steps = ((max_tp / lowest).log2().max(0.0) * POINTS_PER_OCTAVE).ceil() as usize;
+        let mut cache_sizes: Vec<usize> = Vec::with_capacity(steps + 1);
+        for step in 0..=steps {
+            let size = (lowest * 2f64.powf(step as f64 / POINTS_PER_OCTAVE)).round() as usize;
+            if cache_sizes.last().is_none_or(|last| size > *last) {
+                cache_sizes.push(size);
+            }
+        }
 
         // Calculate all miss ratios in parallel and show progress
         let pb = ProgressBar::new(cache_sizes.len() as u64);
