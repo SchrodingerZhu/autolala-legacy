@@ -43,9 +43,11 @@ import importlib.util
 import json
 import os
 import queue
+import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -131,12 +133,25 @@ def run_kernel(job: dict, core: int, args) -> list[dict]:
     """The three commands for one kernel, in workflow order; later ones need base.json."""
     common = {"category": job["category"], "kernel": job["kernel"], "chunk": args.chunk,
               "block_size": args.block_size, "cpu_threads": args.cpu_threads}
+    # The base derivation lives in tmpfs while it is timed: the report can run
+    # to hundreds of megabytes, and a disk write inside the measured command
+    # would be charged to the derivation. It is copied out afterwards so
+    # scaling and associativity can be re-timed without re-deriving.
+    keep_dir = REPO / "target" / "category-kernels" / "base"
+    keep_dir.mkdir(parents=True, exist_ok=True)
+    scratch = tempfile.TemporaryDirectory()
+    base = Path(scratch.name) / "base.json"
+    try:
+        rows = timed_workflow(job, core, args, base, common)
+    finally:
+        if base.exists():
+            shutil.copyfile(base, keep_dir / f"{job['category']}__{job['kernel']}__T{args.base_threads}.json")
+        scratch.cleanup()
+    return rows
+
+
+def timed_workflow(job: dict, core: int, args, base: Path, common: dict) -> list[dict]:
     rows: list[dict] = []
-    # Base derivations are kept so scaling and associativity can be re-timed
-    # later without paying for the derivation again.
-    base_dir = REPO / "target" / "category-kernels" / "base"
-    base_dir.mkdir(parents=True, exist_ok=True)
-    base = base_dir / f"{job['category']}__{job['kernel']}__T{args.base_threads}.json"
 
     seconds, status, _, detail = timed([
         str(ANALYZER), "-i", job["source"], "--json", "-o", str(base), "barvinok",

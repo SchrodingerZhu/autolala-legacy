@@ -327,20 +327,23 @@ fn main_entry() -> anyhow::Result<()> {
         }
     };
 
+    // Buffered: serde_json issues one write per token, and the parallel
+    // report can run to hundreds of megabytes -- unbuffered onto a disk that
+    // took minutes, more than the analysis itself.
     let mut writer = match options.output.as_ref() {
         Some(path) => {
             debug!("Opening output file: {}", path.display());
-            Box::new(std::fs::File::create(path)?) as Box<dyn std::io::Write>
+            Box::new(std::io::BufWriter::new(std::fs::File::create(path)?)) as Box<dyn std::io::Write>
         }
         None => {
             debug!("Writing to stdout");
-            Box::new(std::io::stdout()) as Box<dyn std::io::Write>
+            Box::new(std::io::BufWriter::new(std::io::stdout())) as Box<dyn std::io::Write>
         }
     };
 
     let start_time = std::time::Instant::now();
 
-    match &options.method {
+    let outcome = match &options.method {
         Method::Barvinok {
             barvinok_arg,
             block_size,
@@ -763,7 +766,9 @@ fn main_entry() -> anyhow::Result<()> {
             }
             Ok(())
         }),
-    }
+    };
+    writer.flush()?;
+    outcome
 }
 
 fn main() {
