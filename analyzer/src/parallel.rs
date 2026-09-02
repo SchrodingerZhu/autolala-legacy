@@ -39,6 +39,7 @@ use barvinok::{
     DimType, constraint::Constraint, local_space::LocalSpace, map::Map, set::Set,
 };
 use raffine::tree::Tree;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use statrs::distribution::{ContinuousCDF, Gamma};
 use statrs::function::beta::beta_reg;
@@ -484,7 +485,7 @@ pub fn analyze<'ctx>(
     let derivation_seconds = derivation_started.elapsed().as_secs_f64();
     let scaling_started = std::time::Instant::now();
 
-    let mut expansion = Vec::new();
+    let mut jobs = Vec::new();
     let mut reuse_interval_distribution = Vec::new();
     let mut shared_portion = 0.0;
     let mut private_portion = 0.0;
@@ -492,17 +493,11 @@ pub fn analyze<'ctx>(
     for (reuse_interval, portion) in private_distribution {
         private_portion += portion;
         reuse_interval_distribution.push((reuse_interval, portion, false));
-        expand(
-            &mut expansion,
+        jobs.push(ExpansionJob {
             reuse_interval,
-            portion,
-            Sharing::Private,
-            spec.threads,
-            knobs.short_bound,
-            knobs.racetrack_bins,
-            knobs.nbd_epsilon,
-            knobs.dilation,
-        )?;
+            weight: portion,
+            sharing: Sharing::Private,
+        });
     }
 
     // One traversal of the shared data, in accesses: the longest reuse interval
@@ -519,39 +514,28 @@ pub fn analyze<'ctx>(
         if degree_mass <= 0.0 {
             // No degree information: fall back to the paper's assumption that
             // every thread shares.
-            expand(
-                &mut expansion,
+            jobs.push(ExpansionJob {
                 reuse_interval,
-                portion,
-                Sharing::Shared {
+                weight: portion,
+                sharing: Sharing::Shared {
                     sharers: spec.threads,
                     lap,
                 },
-                spec.threads,
-                knobs.short_bound,
-                knobs.racetrack_bins,
-                knobs.nbd_epsilon,
-                knobs.dilation,
-            )?;
+            });
             continue;
         }
         // The degree distribution is measured over all shared accesses rather
         // than per reuse interval, so this treats the two as independent. The
         // joint law would cost one barvinok run per distinct degree.
         for (sharers, degree_weight) in sharing_degrees.iter().copied() {
-            expand(
-                &mut expansion,
+            jobs.push(ExpansionJob {
                 reuse_interval,
-                portion * degree_weight / degree_mass,
-                Sharing::Shared { sharers, lap },
-                spec.threads,
-                knobs.short_bound,
-                knobs.racetrack_bins,
-                knobs.nbd_epsilon,
-                knobs.dilation,
-            )?;
+                weight: portion * degree_weight / degree_mass,
+                sharing: Sharing::Shared { sharers, lap },
+            });
         }
     }
+    let expansion = expand_all(&jobs, spec.threads, knobs)?;
 
     Ok(ParallelReport {
         threads: spec.threads,
@@ -612,7 +596,7 @@ pub fn rescale(path: &std::path::Path, threads: u32, knobs: &CriKnobs) -> Result
         .fold(0.0f64, f64::max);
 
     let scaling_started = std::time::Instant::now();
-    let mut expansion = Vec::new();
+    let mut jobs = Vec::new();
     let mut private_portion = 0.0;
     let mut shared_portion = 0.0;
     for (reuse_interval, portion, is_shared) in source.reuse_interval_distribution.iter().copied() {
@@ -626,18 +610,13 @@ pub fn rescale(path: &std::path::Path, threads: u32, knobs: &CriKnobs) -> Result
             private_portion += portion;
             Sharing::Private
         };
-        expand(
-            &mut expansion,
+        jobs.push(ExpansionJob {
             reuse_interval,
-            portion,
+            weight: portion,
             sharing,
-            threads,
-            knobs.short_bound,
-            knobs.racetrack_bins,
-            knobs.nbd_epsilon,
-            knobs.dilation,
-        )?;
+        });
     }
+    let expansion = expand_all(&jobs, threads, knobs)?;
 
     Ok(ParallelReport {
         threads,
@@ -987,6 +966,48 @@ fn quantize_racetrack(
     Ok(())
 }
 
+/// One reuse-interval entry awaiting expansion into its CRI law.
+#[derive(Clone, Copy, Debug)]
+struct ExpansionJob {
+    reuse_interval: f64,
+    weight: f64,
+    sharing: Sharing,
+}
+
+/// Expands every job with [`expand`], in parallel.
+///
+/// Entries are independent, so this is a plain data-parallel map. The results
+/// are collected in job order and concatenated, so the output is exactly what
+/// the sequential loop produced -- the parallelism changes the time, not the
+/// answer. On kernels with many distinct intervals this loop, not barvinok, is
+/// most of the analysis: covariance spends 17s deriving and 831s expanding when
+/// run on one core.
+fn expand_all(jobs: &[ExpansionJob], threads: u32, knobs: &CriKnobs) -> Result<Vec<(f64, f64)>> {
+    let parts: Vec<Result<Vec<(f64, f64)>>> = jobs
+        .par_iter()
+        .map(|job| {
+            let mut out = Vec::new();
+            expand(
+                &mut out,
+                job.reuse_interval,
+                job.weight,
+                job.sharing,
+                threads,
+                knobs.short_bound,
+                knobs.racetrack_bins,
+                knobs.nbd_epsilon,
+                knobs.dilation,
+            )?;
+            Ok(out)
+        })
+        .collect();
+    let mut expansion = Vec::with_capacity(parts.iter().filter_map(|p| p.as_ref().ok()).map(Vec::len).sum());
+    for part in parts {
+        expansion.extend(part?);
+    }
+    Ok(expansion)
+}
+
 /// Rounds a CRI expansion onto the integer support the Denning recursion wants,
 /// merging duplicates and sorting by reuse interval.
 ///
@@ -995,7 +1016,9 @@ fn quantize_racetrack(
 /// deliberately not renormalized to sum to one.
 pub fn to_denning_support(mut expansion: Vec<(f64, f64)>) -> Vec<(isize, f64)> {
     expansion.retain(|(interval, weight)| interval.is_finite() && *weight > 0.0);
-    expansion.sort_by(|a, b| a.0.total_cmp(&b.0));
+    // Stable, so equal intervals keep job order and the merged weights sum in
+    // the same sequence as the sequential version: identical output.
+    expansion.par_sort_by(|a, b| a.0.total_cmp(&b.0));
     let mut out: Vec<(isize, f64)> = vec![(0, 0.0)];
     for (interval, weight) in expansion {
         let rounded = interval.round().max(0.0) as isize;
