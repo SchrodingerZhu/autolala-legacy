@@ -168,8 +168,17 @@ def timed_workflow(job: dict, core: int, args, base: Path, common: dict) -> list
                      "associativity": args.associativity, "seconds": 0.0,
                      "status": "skipped", "detail": "no kept base derivation"}]
         assoc = base.with_name("assoc.json")
-        converted = subprocess.run([str(ASSOC_CONV), "-i", str(kept), "-o", str(assoc),
-                                    "-a", str(args.associativity)], capture_output=True)
+        # Untimed, so rayon may run -- but on the cores the measurements do
+        # not use: 48 unpinned conversions would starve the pinned, niced
+        # `mrc` runs, and single-threaded ones take up to 800 s each.
+        spare = [c for c in range(os.cpu_count() or 1)
+                 if not args.first_core <= c < args.first_core + args.workers]
+        confine = (["taskset", "-c", ",".join(map(str, spare))] if spare else [])
+        converted = subprocess.run(
+            [*confine, str(ASSOC_CONV), "-i", str(kept), "-o", str(assoc),
+             "-a", str(args.associativity)],
+            capture_output=True,
+            env=dict(os.environ, RAYON_NUM_THREADS=str(max(1, len(spare) // 8))))
         if converted.returncode != 0:
             # A base left behind by a censored derivation is truncated.
             return [{**common, "step": "prediction", "threads": args.base_threads,
