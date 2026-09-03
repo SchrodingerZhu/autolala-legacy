@@ -1761,10 +1761,16 @@ dependencies = [
 name = "mrc"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "barvinok",
+ "denning",
+ "gmp-mpfr-sys",
  "palc",
  "serde",
+ "serde_json",
  "simd-json",
  "splines",
+ "symbolica",
 ]
 
 [[package]]

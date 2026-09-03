@@ -387,6 +387,7 @@ fn main_entry() -> anyhow::Result<()> {
                     let output = serde_json::json!({
                         "parallel": &report,
                         "miss_ratio_curve": &curve,
+                        "total_count": &report.total_count,
                         "elapsed_seconds": start_time.elapsed().as_secs_f64(),
                     });
                     writeln!(writer, "{output}")?;
@@ -560,6 +561,7 @@ fn main_entry() -> anyhow::Result<()> {
                     let output = serde_json::json!({
                         "parallel": &report,
                         "miss_ratio_curve": &curve,
+                        "total_count": &report.total_count,
                         "elapsed_seconds": start_time.elapsed().as_secs_f64(),
                         "timings": {
                             "derivation": derivation_seconds,

@@ -842,6 +842,25 @@ fn total_count_piece<'a>(
     }
 }
 
+/// The access total as the string the JSON reports carry (`"96000000"`, or
+/// `"[guard] => expr"` when it depends on the parameters), so `mrc` can turn
+/// a miss ratio into a miss count.
+pub fn total_count_string(total: &PiecewiseQuasiPolynomial<'_>) -> Result<String> {
+    let (total_count, total_domain) = total_count_piece(total)?;
+    let expr = format!(
+        "{}",
+        convert_quasi_poly(total_count)?
+            .to_expression()
+            .printer(PrintOptions::latex())
+    );
+    let guard = domain_guard(&total_domain);
+    Ok(if guard.is_empty() {
+        expr
+    } else {
+        format!("\\left[{guard}\\right] \\Rightarrow {expr}")
+    })
+}
+
 /// The constraint part of a set's textual form (empty for the universe).
 fn domain_guard(domain: &Set<'_>) -> String {
     let raw = format!("{domain:?}");
@@ -1328,6 +1347,53 @@ struct BarvinokResult {
     total_count: String,
     miss_ratio_curve: MissRatioCurve,
     analysis_time: Duration,
+    symbolic: SymbolicDistribution,
+}
+
+/// The distribution in a form that round-trips: expressions in symbolica's
+/// canonical syntax (`Atom::parse` reads them back, namespaces included) and
+/// domains in isl's syntax (`Set::from_str`). The LaTeX fields above are for
+/// reading; this is for instantiating -- `mrc --symbol p0=256 ...` fixes the
+/// parameters, enumerates each piece's domain and rebuilds the histogram.
+#[derive(Serialize)]
+pub struct SymbolicDistribution {
+    /// Program parameters, in isl parameter order (`p0`, `p1`, ...).
+    pub params: Vec<String>,
+    pub total: SymbolicTotal,
+    pub items: Vec<SymbolicItem>,
+}
+
+/// Access count, piecewise in the parameters (several pieces when a
+/// parameter's range admits empty loops, e.g. a lower bound of 0).
+#[derive(Serialize)]
+pub struct SymbolicTotal {
+    pub pieces: Vec<SymbolicTotalPiece>,
+}
+
+#[derive(Serialize)]
+pub struct SymbolicTotalPiece {
+    /// Access count as a polynomial in the parameters.
+    pub expr: String,
+    /// Parameter domain on which `expr` is valid.
+    pub domain: String,
+}
+
+#[derive(Serialize)]
+pub struct SymbolicItem {
+    /// Reuse interval, a polynomial in the parameters and the piece's free
+    /// iterators (which appear as extra isl parameters of the piece domains).
+    pub value: String,
+    pub pieces: Vec<SymbolicPiece>,
+}
+
+#[derive(Serialize)]
+pub struct SymbolicPiece {
+    /// Number of accesses with reuse interval `value`, at each point of `domain`.
+    pub count: String,
+    /// isl set over the parameters and free iterators; parameter-only
+    /// (no set dimensions), so instantiation moves the remaining parameters
+    /// into the set space and enumerates its points.
+    pub domain: String,
 }
 
 pub fn create_json_output<'a>(
@@ -1336,49 +1402,126 @@ pub fn create_json_output<'a>(
     start_time: Instant,
 ) -> Result<String> {
     let distribution = get_distro(dist, total.clone()).unwrap_or_default();
-    let (total_count, total_domain) = total_count_piece(&total)?;
-    let total_count_poly = convert_quasi_poly(total_count)?;
+    // Every piece of the total, so a parameter range that admits empty loops
+    // (a lower bound of 0 splits the count) is reported rather than refused.
+    let mut total_pieces: Vec<(Poly, Set<'a>)> = Vec::new();
+    total.foreach_piece(|qpoly, domain| {
+        total_pieces.push((convert_quasi_poly(qpoly)?, domain));
+        Ok(())
+    })?;
+    if total_pieces.is_empty() {
+        return Err(anyhow::anyhow!("no total count found"));
+    }
+    let n_program_params = total_pieces[0].1.n_param()?;
+    // The count piece's domain carries the free iterators as extra trailing
+    // parameters; dropping them leaves a set over the program parameters that
+    // can be intersected with the total's piece domains.
+    let total_piece_for = |domain: &Set<'a>| -> Result<usize> {
+        if total_pieces.len() == 1 {
+            return Ok(0);
+        }
+        let extra = domain.n_param()?.saturating_sub(n_program_params);
+        let over_params = domain
+            .clone()
+            .project_out(DimType::Param, n_program_params, extra)?;
+        for (index, (_, total_domain)) in total_pieces.iter().enumerate() {
+            let common = over_params.clone().intersect(total_domain.clone())?;
+            if !common.is_empty()? {
+                return Ok(index);
+            }
+        }
+        Err(anyhow::anyhow!(
+            "count piece domain {domain:?} meets no piece of the total count"
+        ))
+    };
     let mut ri_values = Vec::new();
     let mut symbol_ranges = Vec::new();
     let mut counts = Vec::new();
     let mut portions = Vec::new();
+    let mut symbolic_items = Vec::new();
     let ring = IntegerRing::new();
     let field = RationalPolynomialField::new(ring);
     for item in dist.iter() {
         let value = convert_quasi_poly(item.qpoly.clone())?;
         let value_str = format!("{}", value.to_expression().printer(PrintOptions::latex()));
+        let mut pieces = Vec::new();
+        // isl's callback can only carry its own error type; ours is parked
+        // here and raised after the loop.
+        let mut failure: Option<anyhow::Error> = None;
         item.cardinality.foreach_piece(|qpoly, domain| {
+            if failure.is_some() {
+                return Ok(());
+            }
             let poly = convert_quasi_poly(qpoly.clone())?;
             let count = format!("{}", poly.to_expression().printer(PrintOptions::latex()));
             let range = domain_guard(&domain);
-            let portion = field.div(&poly, &total_count_poly);
+            let total_index = match total_piece_for(&domain) {
+                Ok(index) => index,
+                Err(e) => {
+                    failure = Some(e);
+                    return Ok(());
+                }
+            };
+            let total_count_poly = &total_pieces[total_index].0;
+            let portion = field.div(&poly, total_count_poly);
             let portion_str = format!("{}", portion.to_expression().printer(PrintOptions::latex()));
             ri_values.push(value_str.clone());
             symbol_ranges.push(range);
             counts.push(count);
             portions.push(portion_str);
+            pieces.push(SymbolicPiece {
+                count: poly.to_expression().to_canonical_string(),
+                domain: format!("{domain:?}"),
+            });
             Ok(())
         })?;
+        if let Some(e) = failure {
+            return Err(e);
+        }
+        symbolic_items.push(SymbolicItem {
+            value: value.to_expression().to_canonical_string(),
+            pieces,
+        });
     }
+    let mut params = Vec::new();
+    let first_domain = &total_pieces[0].1;
+    for i in 0..n_program_params {
+        params.push(first_domain.get_dim_name(DimType::Param, i)?.unwrap_or_default().to_string());
+    }
+    let symbolic = SymbolicDistribution {
+        params,
+        total: SymbolicTotal {
+            pieces: total_pieces
+                .iter()
+                .map(|(poly, domain)| SymbolicTotalPiece {
+                    expr: poly.to_expression().to_canonical_string(),
+                    domain: format!("{domain:?}"),
+                })
+                .collect(),
+        },
+        items: symbolic_items,
+    };
     let ri_values = ri_values.into_boxed_slice();
     let symbol_ranges = symbol_ranges.into_boxed_slice();
     let counts = counts.into_boxed_slice();
     let portions = portions.into_boxed_slice();
-    let total_count_expr = format!(
-        "{}",
-        total_count_poly
-            .to_expression()
-            .printer(PrintOptions::latex())
-    );
-    // A single-piece total keeps its domain guard: the expression is only
-    // valid on the piece domain, and rendering it bare would silently claim
-    // validity everywhere (e.g. outside the parameter range).
-    let guard = domain_guard(&total_domain);
-    let total_count = if guard.is_empty() {
-        total_count_expr
-    } else {
-        format!("\\left[{guard}\\right] \\Rightarrow {total_count_expr}")
-    };
+    // Each piece keeps its domain guard: the expression is only valid on the
+    // piece domain, and rendering it bare would silently claim validity
+    // everywhere (e.g. outside the parameter range). Several pieces are
+    // joined with `;`.
+    let total_count = total_pieces
+        .iter()
+        .map(|(poly, domain)| {
+            let expr = format!("{}", poly.to_expression().printer(PrintOptions::latex()));
+            let guard = domain_guard(domain);
+            if guard.is_empty() {
+                expr
+            } else {
+                format!("\\left[{guard}\\right] \\Rightarrow {expr}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ; ");
     let miss_ratio_curve = MissRatioCurve::new(&distribution);
     let analysis_time = start_time.elapsed();
     let result = BarvinokResult {
@@ -1389,6 +1532,7 @@ pub fn create_json_output<'a>(
         miss_ratio_curve,
         total_count,
         analysis_time,
+        symbolic,
     };
     let json = serde_json::to_string(&result)
         .map_err(|e| anyhow::anyhow!("failed to serialize to JSON: {e}"))?;

@@ -14,8 +14,12 @@ the way commit a4f6a82 added it -- each stage its own command:
   thread_scaling   analyzer --json barvinok -T <T> -C <chunk> --scale-from base.json
                    Re-applies the CRI laws at another thread count with no
                    polyhedral work.
-  associativity    assoc-conv -i base.json -o /dev/null -a 12
+  associativity    assoc-conv -i base.json -o assoc.json -a 12
                    The 12-way conversion of the base curve.
+  prediction       mrc -i assoc.json -c <cache bytes> -b <block bytes>
+                   Loads the converted curve and reads off the miss ratio and
+                   miss count at one cache size: the per-query cost once the
+                   curve exists.
 
 Two measurement modes, told apart by the `cpu_threads` column:
 
@@ -62,12 +66,13 @@ sys.modules["validate_categories"] = _categories
 _spec.loader.exec_module(_categories)
 ANALYZER = _categories._validate.ANALYZER
 ASSOC_CONV = REPO / "target" / "release" / "assoc-conv"
+MRC = REPO / "target" / "release" / "mrc"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS timings (
     category      TEXT    NOT NULL,
     kernel        TEXT    NOT NULL,
-    step          TEXT    NOT NULL,   -- 'derivation' | 'thread_scaling' | 'associativity'
+    step          TEXT    NOT NULL,   -- 'derivation' | 'thread_scaling' | 'associativity' | 'prediction'
     threads       INTEGER NOT NULL,   -- base T for derivation/associativity, target T for scaling
     chunk         TEXT    NOT NULL,
     block_size    INTEGER NOT NULL,
@@ -75,7 +80,8 @@ CREATE TABLE IF NOT EXISTS timings (
     associativity INTEGER,            -- associativity rows only
     seconds       REAL    NOT NULL,   -- wall clock of the command; the budget on timeout
     status        TEXT    NOT NULL,   -- 'ok' | 'timeout' | 'error' | 'skipped'
-    detail        TEXT,
+    detail        TEXT,               -- error text; on prediction rows the mrc output line
+                                      -- "<file>,<miss count>,<total accesses>,<miss ratio>,<cache bytes>"
     -- the analyzer's own split of the derivation command, ok rows only
     phase_derivation_s REAL,
     phase_scaling_s    REAL,
@@ -144,7 +150,7 @@ def run_kernel(job: dict, core: int, args) -> list[dict]:
     try:
         rows = timed_workflow(job, core, args, base, common)
     finally:
-        if base.exists():
+        if base.exists() and not args.prediction_only:
             shutil.copyfile(base, keep_dir / f"{job['category']}__{job['kernel']}__T{args.base_threads}.json")
         scratch.cleanup()
     return rows
@@ -152,6 +158,29 @@ def run_kernel(job: dict, core: int, args) -> list[dict]:
 
 def timed_workflow(job: dict, core: int, args, base: Path, common: dict) -> list[dict]:
     rows: list[dict] = []
+    if args.prediction_only:
+        # Only the query is timed: the kept base derivation is converted
+        # untimed (unpinned, rayon free), then `mrc` is timed as usual.
+        kept = REPO / "target" / "category-kernels" / "base" / \
+            f"{job['category']}__{job['kernel']}__T{args.base_threads}.json"
+        if not kept.exists():
+            return [{**common, "step": "prediction", "threads": args.base_threads,
+                     "associativity": args.associativity, "seconds": 0.0,
+                     "status": "skipped", "detail": "no kept base derivation"}]
+        assoc = base.with_name("assoc.json")
+        converted = subprocess.run([str(ASSOC_CONV), "-i", str(kept), "-o", str(assoc),
+                                    "-a", str(args.associativity)], capture_output=True)
+        if converted.returncode != 0:
+            # A base left behind by a censored derivation is truncated.
+            return [{**common, "step": "prediction", "threads": args.base_threads,
+                     "associativity": args.associativity, "seconds": 0.0,
+                     "status": "skipped", "detail": "kept base derivation unusable"}]
+        seconds, status, stdout, detail = timed([
+            str(MRC), "-i", str(assoc), "-c", str(args.cache_bytes), "-b", str(args.block_bytes),
+        ], core, args.timeout, args.cpu_threads)
+        return [{**common, "step": "prediction", "threads": args.base_threads,
+                 "associativity": args.associativity, "seconds": seconds, "status": status,
+                 "detail": stdout.strip() if status == "ok" else detail}]
 
     seconds, status, _, detail = timed([
         str(ANALYZER), "-i", job["source"], "--json", "-o", str(base), "barvinok",
@@ -179,6 +208,9 @@ def timed_workflow(job: dict, core: int, args, base: Path, common: dict) -> list
         rows.append({**common, "step": "associativity", "threads": args.base_threads,
                      "associativity": args.associativity, "seconds": 0.0,
                      "status": "skipped", "detail": reason})
+        rows.append({**common, "step": "prediction", "threads": args.base_threads,
+                     "associativity": args.associativity, "seconds": 0.0,
+                     "status": "skipped", "detail": reason})
         return rows
 
     for target in args.scale_to:
@@ -189,12 +221,25 @@ def timed_workflow(job: dict, core: int, args, base: Path, common: dict) -> list
         rows.append({**common, "step": "thread_scaling", "threads": target,
                      "seconds": seconds, "status": status, "detail": detail})
 
+    assoc = base.with_name("assoc.json")
     seconds, status, _, detail = timed([
-        str(ASSOC_CONV), "-i", str(base), "-o", "/dev/null", "-a", str(args.associativity),
+        str(ASSOC_CONV), "-i", str(base), "-o", str(assoc), "-a", str(args.associativity),
     ], core, args.timeout, args.cpu_threads)
     rows.append({**common, "step": "associativity", "threads": args.base_threads,
                  "associativity": args.associativity, "seconds": seconds,
                  "status": status, "detail": detail})
+
+    if status != "ok":
+        rows.append({**common, "step": "prediction", "threads": args.base_threads,
+                     "associativity": args.associativity, "seconds": 0.0,
+                     "status": "skipped", "detail": f"associativity {status}"})
+        return rows
+    seconds, status, stdout, detail = timed([
+        str(MRC), "-i", str(assoc), "-c", str(args.cache_bytes), "-b", str(args.block_bytes),
+    ], core, args.timeout, args.cpu_threads)
+    rows.append({**common, "step": "prediction", "threads": args.base_threads,
+                 "associativity": args.associativity, "seconds": seconds, "status": status,
+                 "detail": stdout.strip() if status == "ok" else detail})
     return rows
 
 
@@ -207,6 +252,10 @@ def main() -> int:
     parser.add_argument("--chunk", default="1")
     parser.add_argument("--block-size", type=int, default=8)
     parser.add_argument("--associativity", type=int, default=12)
+    parser.add_argument("--cache-bytes", type=int, default=256 * 1024,
+                        help="cache size the prediction step queries")
+    parser.add_argument("--block-bytes", type=int, default=64,
+                        help="bytes per block for the prediction step (8 doubles)")
     parser.add_argument("--workers", type=int, default=48)
     parser.add_argument("--first-core", type=int, default=0)
     parser.add_argument("--timeout", type=float, default=900.0)
@@ -217,6 +266,8 @@ def main() -> int:
                              "kernel at a time with rayon free to use every core")
     parser.add_argument("--only-failed", action="store_true",
                         help="re-run only kernels with any non-ok row, keeping the rest")
+    parser.add_argument("--prediction-only", action="store_true",
+                        help="time only the mrc query, from the kept base derivations")
     args = parser.parse_args()
     args.scale_to = [int(value) for value in args.scale_to.split(",")]
     args.cpu_threads = (os.cpu_count() or 1) if args.cpu_threads == "all" else int(args.cpu_threads)
@@ -228,7 +279,7 @@ def main() -> int:
         print("SYMBOLICA_LICENSE is not set; unlicensed Symbolica allows one instance per "
               "machine, so concurrent collection would abort", file=sys.stderr)
         return 2
-    for binary in (ANALYZER, ASSOC_CONV):
+    for binary in (ANALYZER, ASSOC_CONV, MRC):
         if not binary.exists():
             print(f"missing {binary}; run `cargo build --release` first", file=sys.stderr)
             return 2
@@ -289,7 +340,7 @@ def main() -> int:
           f"{'median s':>11}{'max s':>10}")
     print("-" * 74)
     for category in catalogue:
-        for step in ("derivation", "thread_scaling", "associativity"):
+        for step in ("derivation", "thread_scaling", "associativity", "prediction"):
             rows = connection.execute(
                 "SELECT status, seconds FROM timings WHERE category=? AND step=? "
                 "AND cpu_threads=?", (category, step, args.cpu_threads)).fetchall()

@@ -378,6 +378,10 @@ pub struct ParallelReport {
     /// Wall time of the polyhedral part inside this function: the reuse
     /// relations and their barvinok counts. The lowering that precedes it is
     /// timed by the caller.
+    /// Access total of the analysed loop nest, as the sequential report's
+    /// `total_count`; lets `mrc` report miss counts. Absent in older files.
+    #[serde(default)]
+    pub total_count: String,
     pub derivation_seconds: f64,
     /// Wall time of applying the CRI laws to the derived distribution.
     pub scaling_seconds: f64,
@@ -480,6 +484,7 @@ pub fn analyze<'ctx>(
 
     // Both counts are the last of the polyhedral work; everything after this
     // point is closed-form arithmetic over the resulting distributions.
+    let total_count = isl::total_count_string(&total)?;
     let private_distribution = distribution_of(unshared_reuse, total.clone())?;
     let shared_distribution = distribution_of(shared_reuse, total)?;
     let derivation_seconds = derivation_started.elapsed().as_secs_f64();
@@ -547,6 +552,7 @@ pub fn analyze<'ctx>(
         mean_sharing_degree,
         reuse_interval_distribution,
         support: to_denning_support(expansion),
+        total_count,
         derivation_seconds,
         scaling_seconds: scaling_started.elapsed().as_secs_f64(),
     })
@@ -633,6 +639,7 @@ pub fn rescale(path: &std::path::Path, threads: u32, knobs: &CriKnobs) -> Result
         },
         reuse_interval_distribution: source.reuse_interval_distribution,
         support: to_denning_support(expansion),
+        total_count: source.total_count,
         derivation_seconds: 0.0,
         scaling_seconds: scaling_started.elapsed().as_secs_f64(),
     })

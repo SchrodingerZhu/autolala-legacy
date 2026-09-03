@@ -6,5 +6,15 @@ edition = "2024"
 [dependencies]
 palc = { git = "https://github.com/oxalica/palc.git" }
 serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
 simd-json = "0.16"
 splines = "5.0.0"
+anyhow = "1.0.98"
+denning = { path = "../denning" }
+barvinok = { git = "https://github.com/Roc-Locality/barvinok-rs", rev = "cc72f5071bb7a1a9ec11e228fcb1686c2f8d3f6c" }
+symbolica = { version = "2.2", default-features = false, features = [
+    "bincode",
+    "serde",
+    "gmp",
+] }
+gmp-mpfr-sys = { version = "1.6.5", features = ["use-system-libs"] }

@@ -6,6 +6,10 @@ use palc::Parser;
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Data {
     pub miss_ratio_curve: MissRatioCurve,
+    /// Access total of the analysed program, carried through unchanged so
+    /// `mrc` can turn the converted ratio into a miss count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_count: Option<String>,
 }
 
 #[derive(palc::Parser)]
@@ -30,6 +34,7 @@ fn main() {
         miss_ratio_curve: input
             .miss_ratio_curve
             .compute_assoc(cli.assoc),
+        total_count: input.total_count,
     };
     let output: Box<dyn std::io::Write> = if let Some(output_path) = cli.output {
         let file = std::fs::File::create(output_path).expect("Failed to create output file");
