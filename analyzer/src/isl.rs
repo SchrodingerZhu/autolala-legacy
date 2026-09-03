@@ -1,8 +1,8 @@
 use crate::utils::{Poly, get_max_array_dim};
 use ahash::AHashMap;
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use barvinok::{
-    DimType,
+    ContextRef, DimType,
     aff::Affine,
     constraint::Constraint,
     list::List,
@@ -28,7 +28,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+use indicatif::{ParallelProgressIterator, ProgressBar, ProgressStyle};
+use rayon::prelude::*;
 use serde::Serialize;
+use tracing::info;
 use symbolica::{atom::Atom, domains::Field, domains::integer::IntegerRing};
 use symbolica::{atom::AtomCore, symbol};
 use symbolica::{
@@ -681,7 +684,7 @@ impl<'isl, 'mlir, 'map> ExprConverter<'isl, 'mlir, 'map> {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct RIProcessor<'a> {
     pw_qpoly: PiecewiseQuasiPolynomial<'a>,
     /// True support of the counted relation (its domain set). The cardinality
@@ -692,6 +695,238 @@ pub struct RIProcessor<'a> {
     /// otherwise zero-count points are tallied as warm accesses.
     support: Set<'a>,
 }
+
+impl std::fmt::Debug for RIProcessor<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RIProcessor")
+            .field("pw_qpoly", &self.pw_qpoly)
+            .field("support", &self.support)
+            .finish_non_exhaustive()
+    }
+}
+
+/// What a fresh isl context needs to count the way the analysis context
+/// does: barvinok's command-line options and isl's operation budget.
+static COUNTING_OPTIONS: std::sync::OnceLock<CountingOptions> = std::sync::OnceLock::new();
+
+struct CountingOptions {
+    barvinok_args: Vec<String>,
+    max_operations: usize,
+}
+
+/// Records the options every per-thread counting context must replicate.
+/// Call once, after the analysis context has been configured.
+pub fn configure_counting(barvinok_args: &[String], max_operations: usize) {
+    let _ = COUNTING_OPTIONS.set(CountingOptions {
+        barvinok_args: barvinok_args.to_vec(),
+        max_operations,
+    });
+}
+
+/// A progress bar in the style every phase uses; hidden when stderr is not
+/// a terminal, so the timing collectors see nothing.
+pub fn progress(len: usize, what: &str) -> ProgressBar {
+    ProgressBar::new(len as u64)
+        .with_style(
+            ProgressStyle::with_template("{msg:>12} {bar:40} {pos}/{len} ({elapsed})")
+                .expect("valid template"),
+        )
+        .with_message(what.to_string())
+}
+
+/// A spinner with elapsed time for one long isl call that cannot report
+/// progress (lexmax, a cardinality). Hidden off a terminal like [`progress`].
+pub fn spinner(what: &str) -> ProgressBar {
+    let bar = ProgressBar::new_spinner()
+        .with_style(
+            ProgressStyle::with_template("{msg:>12} {spinner} ({elapsed})").expect("valid template"),
+        )
+        .with_message(what.to_string());
+    bar.enable_steady_tick(std::time::Duration::from_millis(120));
+    bar
+}
+
+/// Runs `f` under a spinner labelled `what`.
+pub fn spun<T>(what: &str, f: impl FnOnce() -> T) -> T {
+    let bar = spinner(what);
+    let result = f();
+    bar.finish_and_clear();
+    result
+}
+
+/// Splits a map's isl text into one map per disjunct (basic map). isl prints
+/// a map as `[params] -> { disjunct; disjunct; ... }`; the parameter prefix
+/// and braces are re-attached to every part.
+pub fn split_disjuncts(text: &str) -> Vec<String> {
+    let Some(open) = text.find('{') else {
+        return vec![text.to_string()];
+    };
+    let Some(close) = text.rfind('}') else {
+        return vec![text.to_string()];
+    };
+    let prefix = &text[..=open];
+    let body = &text[open + 1..close];
+    body.split(';')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(|part| format!("{prefix} {part} }}"))
+        .collect()
+}
+
+/// The reuse window of every access in one part of the immediate-predecessor
+/// map, built, restricted and counted in a context created from the given
+/// barvinok options. This is what the `count-window` worker runs.
+///
+/// `pred` maps each access to its immediate earlier same-element access;
+/// `lt`/`ge` are the lexicographic orders; `restrict` optionally limits the
+/// accesses (the second copy under `--infinite-repeat`). Returns the isl
+/// text of the support (accesses that have a reuse) and of the window-size
+/// count per access. Every step is per access, so the parts can be built
+/// independently and unioned.
+pub fn count_reuse_window_part(
+    pred: &str,
+    lt: &str,
+    ge: &str,
+    restrict: Option<&str>,
+    barvinok_args: &[String],
+    max_operations: usize,
+) -> Result<(String, String)> {
+    // SAFETY: the same option strings the analysis context was created with.
+    let context = unsafe { barvinok::Context::from_args(barvinok_args.iter().map(String::as_str)) }?;
+    context.scope(|ctx| -> Result<(String, String)> {
+        ctx.set_max_operations(max_operations);
+        let read = |text: &str| {
+            Map::from_str(ctx, text).map_err(|e| anyhow::anyhow!("re-reading a map: {e:?}"))
+        };
+        let pred = read(pred)?;
+        let after = pred.apply_range(read(lt)?)?;
+        let mut ri = after.intersect(read(ge)?)?;
+        if let Some(restrict) = restrict {
+            let restrict = Set::from_str(ctx, restrict)
+                .map_err(|e| anyhow::anyhow!("re-reading a set: {e:?}"))?;
+            ri = ri.intersect_domain(restrict)?;
+        }
+        let support = ri.clone().domain()?;
+        let values = ri.cardinality()?;
+        Ok((format!("{support:?}"), format!("{values:?}")))
+    })
+}
+
+/// Runs the `count-window` worker for one part and returns its two lines.
+fn count_reuse_window_in_worker(
+    exe: &Path,
+    dir: &Path,
+    index: usize,
+    restrict: bool,
+) -> Result<(String, String)> {
+    let options = COUNTING_OPTIONS.get();
+    let mut command = std::process::Command::new(exe);
+    command
+        .arg("count-window")
+        .arg("--part")
+        .arg(dir.join(format!("part-{index}.isl")))
+        .arg("--lt")
+        .arg(dir.join("lt.isl"))
+        .arg("--ge")
+        .arg(dir.join("ge.isl"));
+    if restrict {
+        command.arg("--restrict").arg(dir.join("restrict.isl"));
+    }
+    if let Some(options) = options {
+        for arg in &options.barvinok_args {
+            command.arg(format!("--barvinok-arg={arg}"));
+        }
+        command.arg("--max-operations").arg(options.max_operations.to_string());
+    }
+    let output = command
+        .output()
+        .with_context(|| format!("spawning {} count-window", exe.display()))?;
+    if !output.status.success() {
+        return Err(anyhow::anyhow!(
+            "count-window worker for part {index} failed ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let text = String::from_utf8(output.stdout)?;
+    let mut lines = text.lines();
+    match (lines.next(), lines.next()) {
+        (Some(support), Some(values)) => Ok((support.to_string(), values.to_string())),
+        _ => Err(anyhow::anyhow!("count-window worker for part {index} printed no result")),
+    }
+}
+
+/// Builds and counts the reuse windows of `immediate_pred` (a single-valued
+/// map, so its disjuncts have disjoint domains) in parallel, one disjunct per
+/// worker process, and unions the results back into `ctx`.
+///
+/// Processes rather than threads: barvinok counts through PolyLib, which
+/// keeps global state, so two counts in one process crash even in separate
+/// isl contexts. The parts and results travel as isl text through files in
+/// the temp dir.
+///
+/// Returns `(support, window counts)`, exactly what the sequential
+/// `apply_range`/`intersect`/`domain`/`cardinality` chain produces.
+pub fn count_reuse_windows<'a>(
+    ctx: ContextRef<'a>,
+    immediate_pred: Map<'a>,
+    lt: &Map<'a>,
+    ge: &Map<'a>,
+    restrict: Option<&Set<'a>>,
+) -> Result<(Set<'a>, PiecewiseQuasiPolynomial<'a>)> {
+    let started = std::time::Instant::now();
+    let parts = split_disjuncts(&format!("{:?}", immediate_pred.make_disjoint()?));
+    let exe = std::env::current_exe()?;
+    let dir = std::env::temp_dir().join(format!("analyzer-windows-{}", std::process::id()));
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join("lt.isl"), format!("{lt:?}"))?;
+    std::fs::write(dir.join("ge.isl"), format!("{ge:?}"))?;
+    if let Some(restrict) = restrict {
+        std::fs::write(dir.join("restrict.isl"), format!("{restrict:?}"))?;
+    }
+    for (index, part) in parts.iter().enumerate() {
+        std::fs::write(dir.join(format!("part-{index}.isl")), part)?;
+    }
+    info!(parts = parts.len(), "windows: split the predecessor map in {:.3}s", started.elapsed().as_secs_f64());
+    let started = std::time::Instant::now();
+    let has_restrict = restrict.is_some();
+    let bar = progress(parts.len(), "windows");
+    let counted: Vec<Result<(String, String)>> = (0..parts.len())
+        .into_par_iter()
+        .progress_with(bar.clone())
+        .map(|index| count_reuse_window_in_worker(&exe, &dir, index, has_restrict))
+        .collect();
+    bar.finish_and_clear();
+    let _ = std::fs::remove_dir_all(&dir);
+    info!("windows: built and counted the parts in {:.3}s", started.elapsed().as_secs_f64());
+    let started = std::time::Instant::now();
+    let mut support: Option<Set<'a>> = None;
+    let mut values: Option<PiecewiseQuasiPolynomial<'a>> = None;
+    let bar = progress(counted.len(), "merging");
+    for part in counted {
+        bar.inc(1);
+        let (support_text, values_text) = part?;
+        let part_support = Set::from_str(ctx, &support_text)
+            .map_err(|e| anyhow::anyhow!("re-reading a support: {e:?}"))?;
+        let part_values = PiecewiseQuasiPolynomial::from_str(ctx, &values_text)
+            .map_err(|e| anyhow::anyhow!("re-reading a count: {e:?}"))?;
+        support = Some(match support {
+            Some(acc) => acc.union(part_support)?,
+            None => part_support,
+        });
+        values = Some(match values {
+            Some(acc) => acc.checked_add(part_values)?,
+            None => part_values,
+        });
+    }
+    bar.finish_and_clear();
+    info!("windows: merged the parts in {:.3}s", started.elapsed().as_secs_f64());
+    match (support, values) {
+        (Some(support), Some(values)) => Ok((support, values)),
+        _ => Err(anyhow::anyhow!("the immediate-predecessor map has no disjuncts")),
+    }
+}
+
 
 #[derive(Clone, Debug)]
 pub struct Piece<'a> {
@@ -731,7 +966,10 @@ impl<'a> RIProcessor<'a> {
     }
     fn get_processed_pieces(&self) -> Result<Box<[Piece<'a>]>, barvinok::Error> {
         let mut pieces = Vec::new();
-        for mut piece in self.get_all_pieces()?.into_vec() {
+        let all = spun("splitting", || self.get_all_pieces())?.into_vec();
+        let bar = progress(all.len(), "restricting");
+        for mut piece in all {
+            bar.inc(1);
             // Restrict each piece to the true support of the counted
             // relation and drop pieces that become empty (see the `support`
             // field doc for why the raw piece domains over-approximate).
@@ -756,18 +994,40 @@ impl<'a> RIProcessor<'a> {
             piece.domain = domain;
             pieces.push(piece);
         }
+        bar.finish_and_clear();
         Ok(pieces.into_boxed_slice())
     }
-    pub fn get_distribution(&self) -> Result<Box<[DistItem<'a>]>, barvinok::Error> {
+    /// The distribution: one item per distinct reuse-interval expression,
+    /// with the count of accesses per parameter point.
+    ///
+    pub fn get_distribution(&self) -> Result<Box<[DistItem<'a>]>> {
+        let started = std::time::Instant::now();
         let mut pieces = self.get_processed_pieces()?;
-        let mut dist_items: Vec<DistItem<'_>> = Vec::new();
+        info!(
+            pieces = pieces.len(),
+            "slicing: split and restricted the pieces in {:.3}s",
+            started.elapsed().as_secs_f64()
+        );
+        let started = std::time::Instant::now();
+        let mut dist_items: Vec<DistItem<'_>> = Vec::with_capacity(pieces.len());
+        // Counted here, sequentially: at most a few percent of the
+        // derivation, and barvinok cannot count on two threads of one
+        // process (see `count_reuse_windows`).
+        let bar = progress(pieces.len(), "slicing");
         for piece in pieces.iter_mut() {
             let cardinality = piece.cardinality()?;
             dist_items.push(DistItem {
                 qpoly: piece.qpoly.clone(),
                 cardinality,
             });
+            bar.inc(1);
         }
+        bar.finish_and_clear();
+        info!(
+            pieces = pieces.len(),
+            "slicing: counted the pieces in {:.3}s",
+            started.elapsed().as_secs_f64()
+        );
         Ok(dist_items.into_boxed_slice())
     }
 }
@@ -1293,9 +1553,12 @@ pub fn get_distro<'a>(
 ) -> Result<Box<[(isize, f64)]>> {
     let dist = convert_dist(dist, total)?;
     let mut result = AHashMap::new();
+    let bar = progress(dist.len(), "instantiating");
     for item in dist.iter() {
         item.add_to_dist(&mut result)?;
+        bar.inc(1);
     }
+    bar.finish_and_clear();
     let mut vector = vec![(0, 0.0)];
     vector.extend(result.iter().map(|(k, v)| (*k, *v)));
     vector.sort_unstable_by_key(|a| a.0);
@@ -1441,7 +1704,9 @@ pub fn create_json_output<'a>(
     let mut symbolic_items = Vec::new();
     let ring = IntegerRing::new();
     let field = RationalPolynomialField::new(ring);
+    let bar = progress(dist.len(), "rendering");
     for item in dist.iter() {
+        bar.inc(1);
         let value = convert_quasi_poly(item.qpoly.clone())?;
         let value_str = format!("{}", value.to_expression().printer(PrintOptions::latex()));
         let mut pieces = Vec::new();
@@ -1483,6 +1748,7 @@ pub fn create_json_output<'a>(
             pieces,
         });
     }
+    bar.finish_and_clear();
     let mut params = Vec::new();
     let first_domain = &total_pieces[0].1;
     for i in 0..n_program_params {

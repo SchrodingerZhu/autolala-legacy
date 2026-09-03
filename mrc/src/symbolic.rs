@@ -16,6 +16,8 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use barvinok::{DimType, aff::Affine, set::{BasicSet, Set}};
 use denning::MissRatioCurve;
 use serde::Deserialize;
+use indicatif::{ParallelProgressIterator, ProgressBar, ProgressStyle};
+use rayon::prelude::*;
 use symbolica::atom::{Atom, AtomView, Symbol};
 use symbolica::parser::ParseSettings;
 
@@ -159,79 +161,41 @@ pub fn instantiate(
     // is checked against it in the tests.
     let use_isl_points = std::env::var_os("MRC_ISL_POINTS").is_some();
     let started = Instant::now();
+    let jobs: Vec<PieceJob<'_>> = dist
+        .items
+        .iter()
+        .flat_map(|item| {
+            item.pieces.iter().map(move |piece| PieceJob {
+                value: &item.value,
+                count: &piece.count,
+                domain: &piece.domain,
+            })
+        })
+        .collect();
+    let bar = ProgressBar::new(jobs.len() as u64).with_style(
+        ProgressStyle::with_template("{msg} {bar:40} {pos}/{len} pieces ({elapsed})")
+            .expect("valid template"),
+    );
+    bar.set_message("instantiating");
+    // Every piece is independent: an isl context is not thread-safe, so
+    // each task opens its own, and everything after extraction is plain
+    // data. Results are collected in piece order and merged sequentially,
+    // so the histogram does not depend on the thread count.
+    let counted: Vec<Result<PieceHistogram>> = jobs
+        .par_iter()
+        .progress_with(bar.clone())
+        .map(|job| count_piece(job, values, use_isl_points))
+        .collect();
+    bar.finish_and_clear();
     let mut histogram: HashMap<isize, f64> = HashMap::new();
     let mut points = 0usize;
-    barvinok::Context::new().scope(|ctx| -> Result<()> {
-        for item in &dist.items {
-            let value_atom = parse_expr(&item.value)?;
-            for piece in &item.pieces {
-                let count_atom = parse_expr(&piece.count)?;
-                let mut slots = Slots::new();
-                let value_expr = compile(value_atom.as_view(), &mut slots);
-                let count_expr = compile(count_atom.as_view(), &mut slots);
-                let domain = Set::from_str(ctx, &piece.domain)
-                    .map_err(|e| anyhow!("piece domain `{}`: {e:?}", piece.domain))?;
-                let domain = fix_params(domain, values)?;
-                if domain.is_empty()? {
-                    continue;
-                }
-                // The free iterators are isl parameters of the piece; make
-                // them set dimensions so isl can enumerate them.
-                let n_param = domain.n_param()?;
-                let domain = domain.move_dims(DimType::Out, 0, DimType::Param, 0, n_param)?;
-                if !domain.is_bounded()? {
-                    bail!("piece domain is unbounded after fixing the parameters: {domain:?}");
-                }
-                let space = domain.get_space()?;
-                let dims = space.dim(DimType::Out)?;
-                // Which set dimension feeds which slot; dims the expressions
-                // never mention are enumerated but not read.
-                let mut bound_dims = Vec::new();
-                for i in 0..dims {
-                    if let Some(name) = space.get_dim_name(DimType::Out, i)?
-                        && let Some(slot) = slots.by_name(name)
-                    {
-                        bound_dims.push((i as i32, slot));
-                    }
-                }
-                let mut env = vec![0.0; slots.0.len()];
-                bind_params(&slots, values, &mut env);
-                let mut visit = |coordinates: &[i64]| -> Result<()> {
-                    for (dim, slot) in &bound_dims {
-                        env[*slot] = coordinates[*dim as usize] as f64;
-                    }
-                    let value = evaluate(&value_expr, &env)?;
-                    let count = evaluate(&count_expr, &env)?;
-                    if count == 0.0 {
-                        return Ok(());
-                    }
-                    *histogram.entry(value.round() as isize).or_insert(0.0) += count;
-                    points += 1;
-                    Ok(())
-                };
-                match (!use_isl_points).then(|| Polytope::extract(&domain)).transpose()?.flatten() {
-                    Some(polytope) => polytope.for_each_point(&mut visit)?,
-                    None => {
-                        // Fallback: let isl enumerate (slower, always correct).
-                        let mut enumerated = Vec::new();
-                        domain.foreach_point(|point| {
-                            enumerated.push(point);
-                            Ok(())
-                        })?;
-                        let mut coordinates = vec![0i64; dims as usize];
-                        for point in enumerated {
-                            for (i, c) in coordinates.iter_mut().enumerate() {
-                                let v = point.get_coordinate_val(DimType::Out, i as i32)?;
-                                *c = v.numerator() / v.denominator();
-                            }
-                            visit(&coordinates)?;
-                        }
-                    }
-                }
-            }
+    for piece in counted {
+        let piece = piece?;
+        points += piece.points;
+        for (ri, count) in piece.counts {
+            *histogram.entry(ri).or_insert(0.0) += count;
         }
-        Ok(())
-    })?;
+    }
     let histogram_seconds = started.elapsed().as_secs_f64();
     let started = Instant::now();
 
@@ -250,6 +214,154 @@ pub fn instantiate(
         histogram_seconds,
         curve_seconds: started.elapsed().as_secs_f64(),
     })
+}
+
+struct PieceJob<'a> {
+    value: &'a str,
+    count: &'a str,
+    domain: &'a str,
+}
+
+struct PieceHistogram {
+    /// (reuse interval, count) in a deterministic order.
+    counts: Vec<(isize, f64)>,
+    points: usize,
+}
+
+/// Chunks of the outermost dimension a large piece is split into, so one
+/// piece with millions of points is shared among threads too.
+const SCAN_CHUNKS: usize = 64;
+
+fn count_piece(
+    job: &PieceJob<'_>,
+    values: &HashMap<String, i64>,
+    use_isl_points: bool,
+) -> Result<PieceHistogram> {
+    let value_atom = parse_expr(job.value)?;
+    let count_atom = parse_expr(job.count)?;
+    let mut slots = Slots::new();
+    let value_expr = compile(value_atom.as_view(), &mut slots);
+    let count_expr = compile(count_atom.as_view(), &mut slots);
+
+    // Everything isl-related happens inside this context, which lives on
+    // this thread only; what comes out is plain data.
+    enum Extracted {
+        Empty,
+        Polytope(Polytope, Vec<(i32, usize)>),
+        Points(Vec<Vec<i64>>, Vec<(i32, usize)>),
+    }
+    let extracted = barvinok::Context::new().scope(|ctx| -> Result<Extracted> {
+        let domain = Set::from_str(ctx, job.domain)
+            .map_err(|e| anyhow!("piece domain `{}`: {e:?}", job.domain))?;
+        let domain = fix_params(domain, values)?;
+        if domain.is_empty()? {
+            return Ok(Extracted::Empty);
+        }
+        // The free iterators are isl parameters of the piece; make them set
+        // dimensions so they can be enumerated.
+        let n_param = domain.n_param()?;
+        let domain = domain.move_dims(DimType::Out, 0, DimType::Param, 0, n_param)?;
+        if !domain.is_bounded()? {
+            bail!("piece domain is unbounded after fixing the parameters: {domain:?}");
+        }
+        let space = domain.get_space()?;
+        let dims = space.dim(DimType::Out)?;
+        // Which set dimension feeds which slot; dims the expressions never
+        // mention are enumerated but not read.
+        let mut bound_dims = Vec::new();
+        for i in 0..dims {
+            if let Some(name) = space.get_dim_name(DimType::Out, i)?
+                && let Some(slot) = slots.by_name(name)
+            {
+                bound_dims.push((i as i32, slot));
+            }
+        }
+        if !use_isl_points && let Some(polytope) = Polytope::extract(&domain)? {
+            return Ok(Extracted::Polytope(polytope, bound_dims));
+        }
+        // Fallback: let isl enumerate (slower, always correct).
+        let mut enumerated = Vec::new();
+        domain.foreach_point(|point| {
+            enumerated.push(point);
+            Ok(())
+        })?;
+        let mut points = Vec::with_capacity(enumerated.len());
+        for point in enumerated {
+            let mut coordinates = vec![0i64; dims as usize];
+            for (i, c) in coordinates.iter_mut().enumerate() {
+                let v = point.get_coordinate_val(DimType::Out, i as i32)?;
+                *c = v.numerator() / v.denominator();
+            }
+            points.push(coordinates);
+        }
+        Ok(Extracted::Points(points, bound_dims))
+    })?;
+
+    let mut env_template = vec![0.0; slots.0.len()];
+    bind_params(&slots, values, &mut env_template);
+    let scan = |coordinates: &[i64], env: &mut [f64], acc: &mut HashMap<isize, f64>, points: &mut usize, bound_dims: &[(i32, usize)]| -> Result<()> {
+        for (dim, slot) in bound_dims {
+            env[*slot] = coordinates[*dim as usize] as f64;
+        }
+        let value = evaluate(&value_expr, env)?;
+        let count = evaluate(&count_expr, env)?;
+        if count != 0.0 {
+            *acc.entry(value.round() as isize).or_insert(0.0) += count;
+            *points += 1;
+        }
+        Ok(())
+    };
+    let ordered = |acc: HashMap<isize, f64>| {
+        let mut counts: Vec<(isize, f64)> = acc.into_iter().collect();
+        counts.sort_unstable_by_key(|(ri, _)| *ri);
+        counts
+    };
+    match extracted {
+        Extracted::Empty => Ok(PieceHistogram {
+            counts: Vec::new(),
+            points: 0,
+        }),
+        Extracted::Points(points_list, bound_dims) => {
+            let mut env = env_template;
+            let mut acc = HashMap::new();
+            let mut points = 0;
+            for coordinates in &points_list {
+                scan(coordinates, &mut env, &mut acc, &mut points, &bound_dims)?;
+            }
+            Ok(PieceHistogram {
+                counts: ordered(acc),
+                points,
+            })
+        }
+        Extracted::Polytope(polytope, bound_dims) => {
+            let ranges = polytope.outer_ranges(SCAN_CHUNKS);
+            let partial: Vec<Result<(HashMap<isize, f64>, usize)>> = ranges
+                .par_iter()
+                .map(|(low, high)| {
+                    let mut env = env_template.clone();
+                    let mut acc = HashMap::new();
+                    let mut points = 0;
+                    polytope.for_each_point_in(*low, *high, &mut |coordinates| {
+                        scan(coordinates, &mut env, &mut acc, &mut points, &bound_dims)
+                    })?;
+                    Ok((acc, points))
+                })
+                .collect();
+            let mut acc = HashMap::new();
+            let mut points = 0;
+            for part in partial {
+                let (part, n) = part?;
+                points += n;
+                for (ri, count) in part {
+                    *acc.entry(ri).or_insert(0.0) += count;
+                }
+            }
+            Ok(PieceHistogram {
+                counts: ordered(acc),
+                points,
+            })
+        }
+    }
 }
 
 fn bind_params(slots: &Slots, values: &HashMap<String, i64>, env: &mut [f64]) {
@@ -439,15 +551,64 @@ impl Polytope {
         }))
     }
 
-    fn for_each_point(&self, visit: &mut impl FnMut(&[i64]) -> Result<()>) -> Result<()> {
+    /// The dimension a parallel scan is split on: the outermost one whose
+    /// range has more than one value. The leading dims are the fixed program
+    /// parameters (range 1) and must be skipped or the split is a no-op.
+    fn split_dim(&self) -> Option<usize> {
+        (0..self.dims).find(|&k| self.upper[k] > self.lower[k])
+    }
+
+    /// Splits the split dimension's range into at most `chunks` ranges
+    /// (inclusive bounds) for parallel scanning. A set with no spanning
+    /// dimension is one degenerate range.
+    fn outer_ranges(&self, chunks: usize) -> Vec<(i64, i64)> {
+        let Some(k) = self.split_dim() else {
+            return vec![(0, 0)];
+        };
+        let (low, high) = (self.lower[k], self.upper[k]);
+        if low > high {
+            return Vec::new();
+        }
+        let span = (high - low + 1) as usize;
+        let chunks = chunks.clamp(1, span);
+        let step = span.div_ceil(chunks) as i64;
+        let mut ranges = Vec::with_capacity(chunks);
+        let mut start = low;
+        while start <= high {
+            let end = (start + step - 1).min(high);
+            ranges.push((start, end));
+            start = end + 1;
+        }
+        ranges
+    }
+
+    /// Visits the points whose split-dimension coordinate lies in
+    /// `low..=high` (every point when there is no spanning dimension).
+    fn for_each_point_in(
+        &self,
+        low: i64,
+        high: i64,
+        visit: &mut impl FnMut(&[i64]) -> Result<()>,
+    ) -> Result<()> {
         let mut coordinates = self.lower.clone();
-        if self.dims == 0 {
+        if self.lower.iter().zip(&self.upper).any(|(l, u)| l > u) {
+            return Ok(());
+        }
+        let Some(k) = self.split_dim() else {
             if self.pieces.iter().any(|p| p.contains(&coordinates)) {
                 visit(&coordinates)?;
             }
             return Ok(());
+        };
+        if low > high {
+            return Ok(());
         }
-        if self.lower.iter().zip(&self.upper).any(|(l, u)| l > u) {
+        let mut lower = self.lower.clone();
+        let mut upper = self.upper.clone();
+        lower[k] = low.max(lower[k]);
+        upper[k] = high.min(upper[k]);
+        coordinates[k] = lower[k];
+        if lower[k] > upper[k] {
             return Ok(());
         }
         loop {
@@ -462,11 +623,11 @@ impl Polytope {
                     return Ok(());
                 }
                 k -= 1;
-                if coordinates[k] < self.upper[k] {
+                if coordinates[k] < upper[k] {
                     coordinates[k] += 1;
                     break;
                 }
-                coordinates[k] = self.lower[k];
+                coordinates[k] = lower[k];
             }
         }
     }

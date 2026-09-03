@@ -39,6 +39,7 @@ use barvinok::{
     DimType, constraint::Constraint, local_space::LocalSpace, map::Map, set::Set,
 };
 use raffine::tree::Tree;
+use indicatif::ParallelProgressIterator;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use statrs::distribution::{ContinuousCDF, Gamma};
@@ -401,7 +402,7 @@ pub fn analyze<'ctx>(
     knobs: &CriKnobs,
 ) -> Result<ParallelReport> {
     let derivation_started = std::time::Instant::now();
-    let total = space.clone().cardinality()?;
+    let total = isl::spun("total", || space.clone().cardinality())?;
 
     let same_element = access_map
         .clone()
@@ -413,11 +414,14 @@ pub fn analyze<'ctx>(
     // data. This is exact, unlike the paper's syntactic rule of "does the
     // subscript mention the parallel induction variable" -- in a stencil every
     // subscript mentions it, yet the halo rows are shared.
-    let cross_thread = same_element
-        .clone()
-        .subtract(same_thread(same_element.clone(), thread_dim)?)?;
-    let shared_times = cross_thread.domain()?;
-    let private_times = space.clone().subtract(shared_times.clone())?;
+    let (shared_times, private_times) = isl::spun("sharing", || -> Result<_> {
+        let cross_thread = same_element
+            .clone()
+            .subtract(same_thread(same_element.clone(), thread_dim)?)?;
+        let shared_times = cross_thread.domain()?;
+        let private_times = space.clone().subtract(shared_times.clone())?;
+        Ok((shared_times, private_times))
+    })?;
 
     // How many distinct threads touch each shared datum. Projecting the
     // same-datum relation's range down to the thread dimension turns
@@ -434,10 +438,10 @@ pub fn analyze<'ctx>(
             .clone()
             .project_out(DimType::Out, 0, thread_dim as u32)?
             .intersect_domain(shared_times.clone())?;
-        let shared_total = shared_times.clone().cardinality()?;
+        let shared_total = isl::spun("shared total", || shared_times.clone().cardinality())?;
+        let sharers_count = isl::spun("degrees", || sharers.clone().cardinality())?;
         let distribution =
-            isl::RIProcessor::new(sharers.clone().cardinality()?, sharers.domain()?)
-                .get_distribution()?;
+            isl::RIProcessor::new(sharers_count, sharers.domain()?).get_distribution()?;
         isl::get_distro(&distribution, shared_total)?
             .iter()
             .copied()
@@ -456,8 +460,12 @@ pub fn analyze<'ctx>(
         0.0
     };
 
-    let greater = space.clone().lex_gt_set(space.clone())?;
-    let at_least = space.clone().lex_ge_set(space.clone())?;
+    let (greater, at_least) = isl::spun("orders", || -> Result<_> {
+        Ok((
+            space.clone().lex_gt_set(space.clone())?,
+            space.clone().lex_ge_set(space.clone())?,
+        ))
+    })?;
 
     // Two reuse relations over the same space. Because the thread dimension is
     // last, the unrestricted order is the original program order, so:
@@ -472,12 +480,15 @@ pub fn analyze<'ctx>(
     // is the wrong quantity, and for data a thread touches only once -- a
     // stencil halo, say -- it does not exist at all, so those accesses would be
     // silently reclassified as compulsory misses.
-    let sequential_reuse = reuse_relation(&same_element, greater.clone(), at_least.clone())?;
-    let private_reuse = reuse_relation(
-        &same_element,
-        same_thread(greater, thread_dim)?,
-        same_thread(at_least, thread_dim)?,
-    )?;
+    let sequential_reuse =
+        isl::spun("shared reuse", || reuse_relation(&same_element, greater.clone(), at_least.clone()))?;
+    let private_reuse = isl::spun("private reuse", || -> Result<_> {
+        reuse_relation(
+            &same_element,
+            same_thread(greater, thread_dim)?,
+            same_thread(at_least, thread_dim)?,
+        )
+    })?;
 
     let shared_reuse = sequential_reuse.intersect_domain(shared_times)?;
     let unshared_reuse = private_reuse.intersect_domain(private_times)?;
@@ -670,7 +681,8 @@ fn distribution_of<'ctx>(
     if support.clone().is_empty()? {
         return Ok(Vec::new());
     }
-    let distribution = isl::RIProcessor::new(relation.cardinality()?, support).get_distribution()?;
+    let counted = isl::spun("counting", || relation.cardinality())?;
+    let distribution = isl::RIProcessor::new(counted, support).get_distribution()?;
     Ok(isl::get_distro(&distribution, total)?
         .iter()
         .copied()
@@ -990,8 +1002,10 @@ struct ExpansionJob {
 /// most of the analysis: covariance spends 17s deriving and 831s expanding when
 /// run on one core.
 fn expand_all(jobs: &[ExpansionJob], threads: u32, knobs: &CriKnobs) -> Result<Vec<(f64, f64)>> {
+    let bar = crate::isl::progress(jobs.len(), "expansion");
     let parts: Vec<Result<Vec<(f64, f64)>>> = jobs
         .par_iter()
+        .progress_with(bar.clone())
         .map(|job| {
             let mut out = Vec::new();
             expand(
@@ -1008,6 +1022,7 @@ fn expand_all(jobs: &[ExpansionJob], threads: u32, knobs: &CriKnobs) -> Result<V
             Ok(out)
         })
         .collect();
+    bar.finish_and_clear();
     let mut expansion = Vec::with_capacity(parts.iter().filter_map(|p| p.as_ref().ok()).map(Vec::len).sum());
     for part in parts {
         expansion.extend(part?);
@@ -1022,6 +1037,7 @@ fn expand_all(jobs: &[ExpansionJob], threads: u32, knobs: &CriKnobs) -> Result<V
 /// misses, so the portions must stay portions of all accesses here — they are
 /// deliberately not renormalized to sum to one.
 pub fn to_denning_support(mut expansion: Vec<(f64, f64)>) -> Vec<(isize, f64)> {
+    let bar = isl::spinner("support");
     expansion.retain(|(interval, weight)| interval.is_finite() && *weight > 0.0);
     // Stable, so equal intervals keep job order and the merged weights sum in
     // the same sequence as the sequential version: identical output.
@@ -1034,6 +1050,7 @@ pub fn to_denning_support(mut expansion: Vec<(f64, f64)>) -> Vec<(isize, f64)> {
             _ => out.push((rounded, weight)),
         }
     }
+    bar.finish_and_clear();
     out
 }
 

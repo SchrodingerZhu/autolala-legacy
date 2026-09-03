@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Time the fully symbolic workflow, per kernel, into the same sqlite database.
 
-Two commands per kernel, both pinned single-core (see collect-timings.py):
+Commands per kernel, pinned single-core by default or, with --cpu-threads all,
+one kernel at a time with rayon free (see collect-timings.py for the modes):
 
   symbolic_derivation  analyzer -i sym_K.mlir --json -o sym.json barvinok
                          --block-size=8 --symbol-lowerbound=<b>... --infinite-repeat
@@ -62,7 +63,7 @@ def read_catalogue() -> list[tuple[str, list[int]]]:
 
 def run_kernel(name: str, bounds: list[int], core: int, args) -> list[dict]:
     common = {"category": "symbolic", "kernel": name, "threads": 1, "chunk": "-",
-              "block_size": args.block_size, "cpu_threads": 1}
+              "block_size": args.block_size, "cpu_threads": args.cpu_threads}
     keep_dir = REPO / "target" / "symbolic"
     keep_dir.mkdir(parents=True, exist_ok=True)
     rows: list[dict] = []
@@ -83,7 +84,7 @@ def run_kernel(name: str, bounds: list[int], core: int, args) -> list[dict]:
                 str(_collect.ANALYZER), "-i", str(SYMBOLIC / f"sym_{name}.mlir"),
                 "--json", "-o", str(report), "barvinok", f"--block-size={args.block_size}",
                 *[f"--symbol-lowerbound={b}" for b in bounds], "--infinite-repeat",
-            ], core, args.timeout, 1)
+            ], core, args.timeout, args.cpu_threads)
             rows.append({**common, "step": "symbolic_derivation", "seconds": seconds,
                          "status": status, "detail": detail})
             if status != "ok":
@@ -107,7 +108,7 @@ def run_kernel(name: str, bounds: list[int], core: int, args) -> list[dict]:
                 str(_collect.MRC), "-i", str(report),
                 *[f"--symbol={name}={v}" for name, v in zip(params, values)],
                 "-c", str(args.cache_bytes), "-b", str(args.block_bytes), "-a", str(assoc),
-            ], core, args.timeout, 1)
+            ], core, args.timeout, args.cpu_threads)
             rows.append({**common, "step": step, "associativity": assoc,
                          "seconds": seconds, "status": status,
                          "detail": (stdout.strip() + " params=" + ",".join(map(str, values)))
@@ -129,7 +130,13 @@ def main() -> int:
     parser.add_argument("--only", default="", help="comma-separated kernel names")
     parser.add_argument("--instantiation-only", action="store_true",
                         help="skip the derivation; time mrc on target/symbolic/<kernel>.json")
+    parser.add_argument("--cpu-threads", default="1",
+                        help="1 = pinned single-core (default); 'all' = one kernel at a time "
+                             "with rayon free to use every core")
     args = parser.parse_args()
+    args.cpu_threads = (os.cpu_count() or 1) if args.cpu_threads == "all" else int(args.cpu_threads)
+    if args.cpu_threads != 1:
+        args.workers = 1
 
     if "SYMBOLICA_LICENSE" not in os.environ:
         print("SYMBOLICA_LICENSE is not set", file=sys.stderr)
@@ -149,7 +156,9 @@ def main() -> int:
     connection = sqlite3.connect(database, check_same_thread=False)
     _collect.migrate(connection)
     connection.executescript(_collect.SCHEMA)
-    print(f"{len(kernels)} symbolic kernels over {args.workers} cores", file=sys.stderr)
+    print(f"{len(kernels)} symbolic kernels, "
+          + (f"{args.workers} pinned cores" if args.cpu_threads == 1
+             else f"one at a time on {args.cpu_threads} cores"), file=sys.stderr)
 
     lock = threading.Lock()
     cores: queue.Queue[int] = queue.Queue()
@@ -182,8 +191,8 @@ def main() -> int:
 
     for step in ("symbolic_derivation", "instantiation", "instantiation_assoc"):
         rows = connection.execute(
-            "SELECT status, seconds FROM timings WHERE category='symbolic' AND step=?",
-            (step,)).fetchall()
+            "SELECT status, seconds FROM timings WHERE category='symbolic' AND step=? "
+            "AND cpu_threads=?", (step, args.cpu_threads)).fetchall()
         ok = sorted(s for status, s in rows if status == "ok")
         print(f"{step:20} n={len(rows)} ok={len(ok)} "
               + (f"median={ok[len(ok)//2]:.3f}s max={ok[-1]:.3f}s" if ok else ""),

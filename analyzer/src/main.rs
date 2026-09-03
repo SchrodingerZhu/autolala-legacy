@@ -129,6 +129,25 @@ enum Method {
         /// block size, if not specified, it will be represented symbolically
         block_size: Option<usize>,
     },
+    /// Internal worker of the barvinok method: builds and counts the reuse
+    /// windows of one disjunct of the immediate-predecessor map (files hold
+    /// isl text). The analyzer spawns one per disjunct, because barvinok's
+    /// counting (PolyLib) keeps global state and cannot run on two threads
+    /// of one process.
+    CountWindow {
+        #[arg(long)]
+        part: PathBuf,
+        #[arg(long)]
+        lt: PathBuf,
+        #[arg(long)]
+        ge: PathBuf,
+        #[arg(long)]
+        restrict: Option<PathBuf>,
+        #[arg(short = 'B', long)]
+        barvinok_arg: Vec<String>,
+        #[arg(long, default_value = "0")]
+        max_operations: usize,
+    },
 }
 
 #[global_allocator]
@@ -344,6 +363,28 @@ fn main_entry() -> anyhow::Result<()> {
     let start_time = std::time::Instant::now();
 
     let outcome = match &options.method {
+        Method::CountWindow {
+            part,
+            lt,
+            ge,
+            restrict,
+            barvinok_arg,
+            max_operations,
+        } => {
+            let read = |path: &PathBuf| std::fs::read_to_string(path);
+            let restrict = restrict.as_ref().map(read).transpose()?;
+            let (support, values) = isl::count_reuse_window_part(
+                &read(part)?,
+                &read(lt)?,
+                &read(ge)?,
+                restrict.as_deref(),
+                barvinok_arg,
+                *max_operations,
+            )?;
+            writeln!(writer, "{support}")?;
+            writeln!(writer, "{values}")?;
+            Ok(())
+        }
         Method::Barvinok {
             barvinok_arg,
             block_size,
@@ -402,6 +443,7 @@ fn main_entry() -> anyhow::Result<()> {
                 return Ok(());
             }
             context.bcontext().set_max_operations(*max_operations);
+            isl::configure_counting(barvinok_arg, *max_operations);
             let (source, from_c) = obtain_mlir_source(&options, &mut reader)?;
             if from_c {
                 context.mcontext().set_allow_unregistered_dialects(true);
@@ -605,37 +647,77 @@ fn main_entry() -> anyhow::Result<()> {
                 return Ok(());
             }
 
-            let gt = space.clone().lex_gt_set(space.clone())?;
-            let lt = gt.clone().reverse()?;
-            let ge = space.clone().lex_ge_set(space.clone())?;
-            let access_rev = access_map.clone().reverse()?;
-            let same_element = access_map.clone().apply_range(access_rev)?;
-            let immediate_pred = same_element.intersect(gt.clone())?.lexmax()?;
-            let after = immediate_pred.apply_range(lt)?;
-            let ri = after.intersect(ge)?;
+            let phase = std::time::Instant::now();
+            let step = std::time::Instant::now();
+            let (gt, lt, ge) = isl::spun("orders", || -> anyhow::Result<_> {
+                let gt = space.clone().lex_gt_set(space.clone())?;
+                let lt = gt.clone().reverse()?;
+                let ge = space.clone().lex_ge_set(space.clone())?;
+                Ok((gt, lt, ge))
+            })?;
+            info!("  relation: lexicographic orders in {:.3}s", step.elapsed().as_secs_f64());
+            let step = std::time::Instant::now();
+            let same_element = isl::spun("same-element", || -> anyhow::Result<_> {
+                let access_rev = access_map.clone().reverse()?;
+                Ok(access_map.clone().apply_range(access_rev)?)
+            })?;
+            info!("  relation: same-element map in {:.3}s", step.elapsed().as_secs_f64());
+            let step = std::time::Instant::now();
+            let candidates = isl::spun("candidates", || same_element.intersect(gt.clone()))?;
+            info!("  relation: earlier same-element pairs in {:.3}s", step.elapsed().as_secs_f64());
+            let step = std::time::Instant::now();
+            let immediate_pred = isl::spun("lexmax", || candidates.lexmax())?;
+            info!("  relation: lexmax in {:.3}s", step.elapsed().as_secs_f64());
             // Under --infinite-repeat keep only reuse intervals whose
             // consuming access (the domain of `ri`) lies in the second copy
             // (leading dim == 1): that copy has a full period of history, so
             // its RIs are the steady-state ones. The reported access total is
             // likewise the cardinality of the second copy only.
-            let (ri, total_space) = if *infinite_repeat {
+            let (restrict, total_space) = if *infinite_repeat {
                 let local_space: LocalSpace = space.get_space()?.try_into()?;
                 let second_copy_eq = Constraint::new_equality(local_space)?
                     .set_coefficient_si(barvinok::DimType::Out, 0, 1)?
                     .set_constant_si(-1)?;
                 let second_copy = space.clone().add_constraint(second_copy_eq)?;
-                (ri.intersect_domain(second_copy.clone())?, second_copy)
+                (Some(second_copy.clone()), second_copy)
             } else {
-                (ri, space.clone())
+                (None, space.clone())
             };
-            let ri_support = ri.clone().domain()?;
-            let ri_values = ri.cardinality()?;
+            // Building each access's reuse window and counting it are the
+            // expensive steps, and both are per access: they run in parallel
+            // over the disjuncts of the predecessor map, each in its own
+            // context. `ANALYZER_SERIAL_RELATION=1` keeps the single-context
+            // chain for comparison.
+            let (ri_support, ri_values) = if std::env::var_os("ANALYZER_SERIAL_RELATION").is_some() {
+                let step = std::time::Instant::now();
+                let (ri, ri_support) = isl::spun("windows", || -> anyhow::Result<_> {
+                    let after = immediate_pred.apply_range(lt)?;
+                    let mut ri = after.intersect(ge)?;
+                    if let Some(second_copy) = &restrict {
+                        ri = ri.intersect_domain(second_copy.clone())?;
+                    }
+                    let support = ri.clone().domain()?;
+                    Ok((ri, support))
+                })?;
+                info!("  relation: reuse window in {:.3}s", step.elapsed().as_secs_f64());
+                let step = std::time::Instant::now();
+                let ri_values = isl::spun("counting", || ri.cardinality())?;
+                info!("  relation: reuse window counted in {:.3}s", step.elapsed().as_secs_f64());
+                (ri_support, ri_values)
+            } else {
+                isl::count_reuse_windows(context.bcontext(), immediate_pred, &lt, &ge, restrict.as_ref())?
+            };
+            info!("derivation: reuse relation built and counted in {:.3}s", phase.elapsed().as_secs_f64());
             debug!("Timestamp space: {:?}", space);
             debug!("Access map: {:?}", access_map);
             debug!("RI values: {:?}", ri_values);
             let processor = isl::RIProcessor::new(ri_values, ri_support);
-            let space_count = total_space.cardinality()?;
+            let phase = std::time::Instant::now();
+            let space_count = isl::spun("total", || total_space.cardinality())?;
+            info!("derivation: access total counted in {:.3}s", phase.elapsed().as_secs_f64());
+            let phase = std::time::Instant::now();
             let raw_distro = processor.get_distribution()?;
+            info!("derivation: distribution sliced in {:.3}s", phase.elapsed().as_secs_f64());
             if let Some(path) = save_distro {
                 isl::save_all_dist_items(&raw_distro, space_count.clone(), path)?;
                 info!("Raw distribution saved to {}", path.display());
