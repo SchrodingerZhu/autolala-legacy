@@ -686,9 +686,13 @@ fn main_entry() -> anyhow::Result<()> {
             // Building each access's reuse window and counting it are the
             // expensive steps, and both are per access: they run in parallel
             // over the disjuncts of the predecessor map, each in its own
-            // context. `ANALYZER_SERIAL_RELATION=1` keeps the single-context
-            // chain for comparison.
-            let (ri_support, ri_values) = if std::env::var_os("ANALYZER_SERIAL_RELATION").is_some() {
+            // context. With a single rayon thread (RAYON_NUM_THREADS=1, the
+            // pinned timing mode) the workers would only add spawn and
+            // re-parse cost, so the single-context chain is used; setting
+            // `ANALYZER_SERIAL_RELATION=1` forces it.
+            let serial = std::env::var_os("ANALYZER_SERIAL_RELATION").is_some()
+                || rayon::current_num_threads() == 1;
+            let (ri_support, ri_values) = if serial {
                 let step = std::time::Instant::now();
                 let (ri, ri_support) = isl::spun("windows", || -> anyhow::Result<_> {
                     let after = immediate_pred.apply_range(lt)?;
